@@ -133,6 +133,16 @@ def interpolate_pooling(
         
     # Reshape back to (B, N_views * target_tokens_per_view, D)
     hidden_out = hidden_pooled.reshape(bs, N, D, -1).permute(0, 1, 3, 2).reshape(bs, -1, D)
+    
+    # Exact token count match guarantee
+    if hidden_out.shape[1] != target_num_tokens:
+        hidden_out = F.interpolate(
+            hidden_out.permute(0, 2, 1),
+            size=target_num_tokens,
+            mode="linear",
+            align_corners=True
+        ).permute(0, 2, 1)
+        
     return hidden_out
 
 
