@@ -1,0 +1,63 @@
+# Geo-JEPA Configuration (d): Full Geo-JEPA (Phase 2 Alignment + Phase 3 Dual-Head Dynamics)
+# Loss: L = L_FM + beta * L_WM_sem + gamma * L_WM_geo + alpha * L_geo
+
+run_id: "full_geo_jepa"
+run_root_dir: "/media/kavinder/hdd2/geo_jepa_runs"
+
+framework:
+  framework_py: "Geo_JEPA"
+  qwenvl:
+    base_vlm: "Qwen/Qwen2.5-VL-3B-Instruct"
+  
+  vj2_model:
+    base_encoder: "facebook/vjepa2-vitl-fpc64-256"
+    special_action_token: "<|action_{}|>"
+    embodied_action_token: "<|embodied_action|>"
+    num_frames: 4
+    depth: 12
+    num_heads: 16
+    num_action_tokens_per_timestep: 3
+    num_embodied_action_tokens_per_instruction: 8
+    beta: 0.1
+
+  action_model:
+    action_type: "GR00T"
+    future_action_window_size: 7
+    past_action_window_size: 0
+    action_horizon: 8
+    diffusion_model_cfg:
+      cross_attention_dim: 2048
+
+  geometric_forcing:
+    enable_geo_alignment: true    # ON (Phase 2 enabled)
+    enable_geo_wm_head: true      # ON (Phase 3 enabled)
+    alpha: 0.5                    # Alignment coefficient
+    gamma: 0.1                    # Geometric WM coefficient
+    geo_target_dim: 128           # 64 tracks * 2 coords
+    alignment_layer_idx: 24       # ~75% depth of 32 layers
+    warmup_steps: 2000            # Warmup over initial N steps
+    warmup_schedule: "linear"
+
+datasets:
+  vla_data:
+    dataset_py: "lerobot_v3_datasets"
+    data_mix: "droid_multiview"
+    data_root_dir: "/media/kavinder/hdd2/datasets/droid"
+    per_device_batch_size: 4
+    CoT_prompt: "Task: {instruction} Actions: {actions} Embodied: {e_actions}"
+  
+  video_data:
+    dataset_py: "video_datasets"
+    data_mix: "ssv2_monocular"
+    data_root_dir: "/media/kavinder/hdd2/datasets/ssv2"
+    per_device_batch_size: 4
+    CoT_prompt: "Video task: {instruction} Actions: {actions}"
+
+trainer:
+  max_train_steps: 50000
+  gradient_accumulation_steps: 2
+  gradient_clipping: 1.0
+  learning_rate:
+    base: 1.0e-4
+  optimizer:
+    betas: [0.9, 0.95]
