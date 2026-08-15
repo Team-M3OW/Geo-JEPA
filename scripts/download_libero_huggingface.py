@@ -24,10 +24,11 @@ def download_libero_suites(target_root: str = "/media/kavinder/hdd2/datasets/lib
     print("=" * 70)
 
     suites = {
-        "libero_spatial": "lerobot/libero_spatial",
-        "libero_object": "lerobot/libero_object",
-        "libero_goal": "lerobot/libero_goal",
-        "libero_10": "lerobot/libero_10",
+        "libero_spatial": "lerobot/libero_spatial_image",
+        "libero_object": "lerobot/libero_object_image",
+        "libero_goal": "lerobot/libero_goal_image",
+        "libero_10": "lerobot/libero_10_image",
+        "libero_plus": "lerobot/libero_plus",
     }
 
     for name, repo_id in suites.items():
