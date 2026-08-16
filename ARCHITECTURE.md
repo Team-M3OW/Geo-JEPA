@@ -92,7 +92,7 @@ $$\tilde{\mathbf{z}}_{\text{VGGT}} = \mathbf{z}_{\text{VGGT}} + \lambda_{\text{p
 ### 3.2 Dynamic Bilinear Interpolation Pooling
 When reshaping spatial patches from sequence length $S = H_p \times W_p$ (e.g., $37 \times 37 = 1369$ for $518 \times 518$ images) to match the VLM token count $S_{\text{VLM}}$:
 
-$$\mathbf{z}_{\text{pooled}} = \operatorname{GridSample}\Big( \tilde{\mathbf{z}}_{\text{VGGT}}, \, S_{\text{target}} = S_{\text{VLM}}, \, \text{mode} = \text{"bilinear"} \Big)$$
+$$\mathbf{z}_{\text{pooled}} = \text{GridSample}\Big( \tilde{\mathbf{z}}_{\text{VGGT}}, \, S_{\text{target}} = S_{\text{VLM}}, \, \text{mode} = \text{"bilinear"} \Big)$$
 
 ### 3.3 Geometric Cosine Alignment Loss ($\mathcal{L}_{\text{geo}}$)
 The student VLM tokens $\mathbf{z}_{\text{VLM}}^{(L24)}$ are projected through a 2-layer MLP $\phi_{\text{align}}: \mathbb{R}^{D_{\text{VLM}}} \to \mathbb{R}^{D_{\text{VGGT}}}$:
@@ -129,12 +129,12 @@ The world model forecasts how the environment evolves conditioned on robot actio
 ### 4.1 Semantic Future State Head ($\hat{\mathbf{s}}^{\text{sem}}$)
 Forecasts high-level video latent representations supervised by the frozen **V-JEPA2** encoder:
 
-$$\mathcal{L}_{\text{WM}}^{\text{sem}} = \frac{1}{T \cdot S \cdot D} \sum_{t=1}^T \sum_{s=1}^S \Big\| \hat{\mathbf{s}}_{t, s}^{\text{sem}} - \operatorname{stop-gradient}(\mathbf{s}_{t, s}^{\text{V-JEPA2}}) \Big\|_1$$
+$$\mathcal{L}_{\text{WM}}^{\text{sem}} = \frac{1}{T \cdot S \cdot D} \sum_{t=1}^T \sum_{s=1}^S \Big\| \hat{\mathbf{s}}_{t, s}^{\text{sem}} - \text{stop-gradient}(\mathbf{s}_{t, s}^{\text{V-JEPA2}}) \Big\|_1$$
 
 ### 4.2 Geometric Dynamics Head ($\hat{\mathbf{s}}^{\text{geo}}$)
 Forecasts 2D/3D point displacement trajectories for $N_p=64$ query points across future horizon $T$:
 
-$$\mathcal{L}_{\text{WM}}^{\text{geo}} = \frac{1}{T \cdot N_p} \sum_{t=1}^T \sum_{p=1}^{N_p} \operatorname{SmoothL1}\Big( \Delta \hat{\mathbf{p}}_{t, p}, \, \operatorname{stop-gradient}(\Delta \mathbf{p}_{t, p}^{\text{canon}}) \Big)$$
+$$\mathcal{L}_{\text{WM}}^{\text{geo}} = \frac{1}{T \cdot N_p} \sum_{t=1}^T \sum_{p=1}^{N_p} \text{SmoothL1}\Big( \Delta \hat{\mathbf{p}}_{t, p}, \, \text{stop-gradient}(\Delta \mathbf{p}_{t, p}^{\text{canon}}) \Big)$$
 
 where $\text{SmoothL1}(x)$ is defined as:
 
