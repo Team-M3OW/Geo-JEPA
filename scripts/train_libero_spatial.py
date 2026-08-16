@@ -104,6 +104,18 @@ class GeoJEPALiberoModel(nn.Module):
 
         self.to(self.device)
 
+    def load_pretrained_backbone(self, ckpt_path: str):
+        """Load pretrained weights from Phase 2 / Phase 1 checkpoint."""
+        if os.path.exists(ckpt_path):
+            print(f"[Phase 3 Fine-Tuning] Initializing from pretrained checkpoint: {ckpt_path}")
+            ckpt = torch.load(ckpt_path, map_location=self.device)
+            state_dict = ckpt.get("model_state", ckpt)
+            model_dict = self.state_dict()
+            pretrained_dict = {k: v for k, v in state_dict.items() if k in model_dict and v.shape == model_dict[k].shape}
+            model_dict.update(pretrained_dict)
+            self.load_state_dict(model_dict)
+            print(f"[Phase 3 Fine-Tuning] Successfully loaded {len(pretrained_dict)} parameter tensors into model.")
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -200,6 +212,12 @@ def run_libero_training(
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = GeoJEPALiberoModel(cfg, device=device)
+    
+    # Load Pretrained Backbone
+    pretrained_ckpt = cfg.get("pretrained_checkpoint", "/media/kavinder/hdd2/geo_jepa_runs/phase2_robot_cotrain/checkpoints/phase2_step_05000.pt")
+    if pretrained_ckpt and os.path.exists(pretrained_ckpt):
+        model.load_pretrained_backbone(pretrained_ckpt)
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.trainer.learning_rate.base, betas=tuple(cfg.trainer.optimizer.betas))
 
     geo_cfg = cfg.framework.geometric_forcing

@@ -3,6 +3,7 @@
 
 run_id: "full_geo_jepa_libero_spatial"
 run_root_dir: "/media/kavinder/hdd2/geo_jepa_runs"
+pretrained_checkpoint: "/media/kavinder/hdd2/geo_jepa_runs/phase2_robot_cotrain/checkpoints/phase2_step_05000.pt"
 
 framework:
   framework_py: "Geo_JEPA"
