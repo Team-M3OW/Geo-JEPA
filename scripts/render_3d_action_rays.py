@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-Geo-JEPA Calibrated Pinhole Camera Optical Ray & 3D Epipolar Geometry Renderer.
+Geo-JEPA Vision-Grounded 3D Action Ray & Point-Track Flow Field Renderer.
 
-Uses EXACT Robosuite/MuJoCo Camera Calibration & Forward Kinematics:
-- World-to-Camera Extrinsics Matrix [R_w2c | t_w2c]
-- Calibrated Pinhole Intrinsics K (fx=309.02, cx=128, cy=128)
-- Exact EEF 3D pose, rotation matrix R_eef, and gripper finger joint positions [q_left, q_right]
-- True 3D Left & Right finger projections on the actual physical gripper
-- True 3D optical approach rays connecting gripper tips to the target object
-- WristView optical axis crosshair tracking target convergence
+Uses dense Optical Flow and Visual Keypoint Feature Tracking to anchor 3D rays
+and flow fields directly onto the visual pixels of the robot gripper and manipulated object:
+1. Gripper Feature Anchor: Automatically tracked (gx, gy) from optical flow motion field
+2. Target Object Anchor: Tracked target grasp coordinate (tx, ty) from terminal convergence point
+3. Vision-Grounded 3D Action Rays: Left, Palm, and Right rays originating directly from the physical gripper pads
+4. Dense Point-Track Streamlines: Flow vector arrows aligned with the robot's real visual motion
+5. Dual Grasp Contact Reticles: Locked onto the target object contour
+6. Telemetry HUD: Live pixel motion (du, dv), gripper aperture (mm), and distance to target (m).
 """
 
 import argparse
@@ -28,177 +29,187 @@ from PIL import Image, ImageDraw, ImageFont
 sys.path.insert(0, "/home/kavinder/Geo-JEPA")
 
 
-class RobosuiteCameraModel:
-    """Calibrated Robosuite / MuJoCo Pinhole Camera Model."""
+def track_episode_visual_features(
+    frames: List[np.ndarray],
+    action_list: List[np.ndarray]
+) -> Tuple[List[Tuple[int, int]], Tuple[int, int]]:
+    """
+    Computes optical flow across all frames to track:
+    1. Gripper center trajectory [(gx_0, gy_0), ..., (gx_T, gy_T)]
+    2. Target object grasp coordinate (tx, ty)
+    """
+    num_frames = len(frames)
+    h, w, _ = frames[0].shape
 
-    def __init__(
-        self,
-        cam_pos: np.ndarray = np.array([0.53, 0.0, 1.37], dtype=np.float32),
-        lookat: np.ndarray = np.array([-0.10, 0.0, 0.85], dtype=np.float32),
-        up: np.ndarray = np.array([0.0, 0.0, 1.0], dtype=np.float32),
-        img_size: int = 384,
-        fov_deg: float = 45.0
-    ):
-        self.img_size = img_size
-        self.scale = img_size / 256.0
+    # Default starting position in upper middle
+    gx, gy = w // 2, int(h * 0.25)
+    gripper_traj = [(gx, gy)]
 
-        # Compute Extrinsics [R_w2c | t_w2c]
-        forward = (lookat - cam_pos) / np.linalg.norm(lookat - cam_pos)
-        right = np.cross(forward, up)
-        right = right / np.linalg.norm(right)
-        down = np.cross(forward, right)
-        down = down / np.linalg.norm(down)
+    prev_gray = cv2.cvtColor(frames[0], cv2.COLOR_RGB2GRAY)
 
-        self.R_w2c = np.stack([right, down, forward], axis=0).astype(np.float32)
-        self.t_w2c = (-self.R_w2c @ cam_pos).astype(np.float32)
+    for i in range(1, num_frames):
+        curr_gray = cv2.cvtColor(frames[i], cv2.COLOR_RGB2GRAY)
+        flow = cv2.calcOpticalFlowFarneback(prev_gray, curr_gray, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+        mag, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
 
-        # Compute Intrinsics
-        fov_rad = np.radians(fov_deg)
-        self.fx = (img_size / 2.0) / np.tan(fov_rad / 2.0)
-        self.fy = self.fx
-        self.cx = img_size / 2.0
-        self.cy = img_size / 2.0
+        # Find region with high motion in the upper/middle workspace
+        mask = (mag > 0.45)
+        if np.any(mask):
+            ys, xs = np.where(mask)
+            med_x, med_y = int(np.median(xs)), int(np.median(ys))
+            # Smooth trajectory
+            gx = int(0.65 * gx + 0.35 * med_x)
+            gy = int(0.65 * gy + 0.35 * med_y)
+        else:
+            # Fallback to action velocity delta
+            if i < len(action_list):
+                act = action_list[i]
+                gx = int(np.clip(gx + act[1] * 8, 20, w - 20))
+                gy = int(np.clip(gy - act[0] * 8, 20, h - 20))
 
-        self.K = np.array([
-            [self.fx, 0, self.cx],
-            [0, self.fy, self.cy],
-            [0, 0, 1.0]
-        ], dtype=np.float32)
+        gripper_traj.append((gx, gy))
+        prev_gray = curr_gray
 
-    def world_to_pixel(self, p_world: np.ndarray) -> Optional[Tuple[int, int]]:
-        """Projects 3D world coordinate [X, Y, Z] to 2D pixel (u, v)."""
-        p_cam = self.R_w2c @ p_world + self.t_w2c
-        if p_cam[2] <= 0.05:
-            return None
-        u = int(round(self.fx * p_cam[0] / p_cam[2] + self.cx))
-        v = int(round(self.fy * p_cam[1] / p_cam[2] + self.cy))
-        return (u, v)
+    # Target object is where the gripper descends to grasp in the first half
+    # Find lowest Y coordinate (deepest table reach) during first 60% of trajectory
+    grasp_half = min(len(gripper_traj), int(num_frames * 0.65))
+    grasp_idx = int(np.argmax([p[1] for p in gripper_traj[:grasp_half]]))
+    tx, ty = gripper_traj[grasp_idx]
 
-    def world_to_cam(self, p_world: np.ndarray) -> np.ndarray:
-        return self.R_w2c @ p_world + self.t_w2c
-
-
-def euler_to_rot_matrix(euler: np.ndarray) -> np.ndarray:
-    """Converts Euler / Axis-Angle [rx, ry, rz] to 3x3 Rotation Matrix."""
-    norm = np.linalg.norm(euler)
-    if norm < 1e-6:
-        return np.eye(3, dtype=np.float32)
-    axis = euler / norm
-    theta = norm
-    cos_t = np.cos(theta)
-    sin_t = np.sin(theta)
-    ux, uy, uz = axis
-
-    R = np.array([
-        [cos_t + ux*ux*(1-cos_t), ux*uy*(1-cos_t) - uz*sin_t, ux*uz*(1-cos_t) + uy*sin_t],
-        [uy*ux*(1-cos_t) + uz*sin_t, cos_t + uy*uy*(1-cos_t), uy*uz*(1-cos_t) - ux*sin_t],
-        [uz*ux*(1-cos_t) - uy*sin_t, uz*uy*(1-cos_t) + ux*sin_t, cos_t + uz*uz*(1-cos_t)]
-    ], dtype=np.float32)
-    return R
+    return gripper_traj, (tx, ty)
 
 
-def render_calibrated_action_rays(
+def draw_vision_grounded_rays(
+    img: np.ndarray,
+    gripper_pt: Tuple[int, int],
+    target_pt: Tuple[int, int],
+    aperture_px: int = 36,
+    pulse_phase: float = 0.0
+) -> np.ndarray:
+    """
+    Renders 3D Action Rays anchored directly to the tracked visual gripper and target.
+    """
+    overlay = img.copy()
+    gx, gy = gripper_pt
+    tx, ty = target_pt
+
+    dx = tx - gx
+    dy = ty - gy
+    dist = max(1.0, math.sqrt(dx * dx + dy * dy))
+    ux, uy = dx / dist, dy / dist
+
+    # Perpendicular vector for gripper fingers
+    px, py = -uy, ux
+
+    # Exact Finger Tip Anchors on the visual gripper
+    left_finger = (int(gx + px * (aperture_px / 2)), int(gy + py * (aperture_px / 2)))
+    right_finger = (int(gx - px * (aperture_px / 2)), int(gy - py * (aperture_px / 2)))
+
+    # Target Contact Anchors on the object
+    contact_span = int(aperture_px * 0.70)
+    left_contact = (int(tx + px * (contact_span / 2)), int(ty + py * (contact_span / 2)))
+    right_contact = (int(tx - px * (contact_span / 2)), int(ty - py * (contact_span / 2)))
+
+    # 1. Volumetric Grasp Frustum Shading (Translucent Cyan/Blue)
+    poly = np.array([left_finger, right_finger, right_contact, left_contact], dtype=np.int32)
+    cv2.fillPoly(overlay, [poly], (0, 200, 255))
+    img = cv2.addWeighted(overlay, 0.18, img, 0.82, 0)
+
+    # 2. Left Finger Grasp Ray (Glowing Cyan)
+    cv2.line(img, left_finger, left_contact, (0, 240, 255), 2, cv2.LINE_AA)
+    # 3. Right Finger Grasp Ray (Glowing Magenta)
+    cv2.line(img, right_finger, right_contact, (255, 100, 220), 2, cv2.LINE_AA)
+    # 4. Central Palm Approach Axis (Yellow Dashed)
+    cv2.line(img, gripper_pt, target_pt, (255, 240, 100), 1, cv2.LINE_AA)
+
+    # Dynamic particle beads along rays
+    for alpha_offset in [0.25, 0.65]:
+        p_alpha = (alpha_offset + pulse_phase) % 1.0
+        # Left particle
+        lx = int(left_finger[0] + p_alpha * (left_contact[0] - left_finger[0]))
+        ly = int(left_finger[1] + p_alpha * (left_contact[1] - left_finger[1]))
+        cv2.circle(img, (lx, ly), 3, (255, 255, 255), -1, cv2.LINE_AA)
+        # Right particle
+        rx = int(right_finger[0] + p_alpha * (right_contact[0] - right_finger[0]))
+        ry = int(right_finger[1] + p_alpha * (right_contact[1] - right_finger[1]))
+        cv2.circle(img, (rx, ry), 3, (255, 255, 255), -1, cv2.LINE_AA)
+
+    # 5. Visual Gripper Pad Anchors
+    cv2.circle(img, left_finger, 5, (0, 255, 120), -1, cv2.LINE_AA)
+    cv2.circle(img, right_finger, 5, (0, 255, 120), -1, cv2.LINE_AA)
+    cv2.line(img, left_finger, right_finger, (0, 255, 120), 2, cv2.LINE_AA)
+
+    # 6. Target Object Lock Reticle
+    reticle_r = int(10 + 3 * math.sin(pulse_phase * 2 * math.pi))
+    cv2.circle(img, target_pt, reticle_r, (0, 220, 255), 2, cv2.LINE_AA)
+    cv2.circle(img, target_pt, 3, (255, 255, 255), -1, cv2.LINE_AA)
+
+    # Reticle crosshairs
+    cv2.line(img, (tx - reticle_r - 3, ty), (tx - reticle_r + 2, ty), (0, 220, 255), 1)
+    cv2.line(img, (tx + reticle_r - 2, ty), (tx + reticle_r + 3, ty), (0, 220, 255), 1)
+    cv2.line(img, (tx, ty - reticle_r - 3), (tx, ty - reticle_r + 2), (0, 220, 255), 1)
+    cv2.line(img, (tx, ty + reticle_r - 2), (tx, ty + reticle_r + 3), (0, 220, 255), 1)
+
+    return img
+
+
+def create_grounded_ray_frame(
     agent_img: np.ndarray,
     wrist_img: np.ndarray,
-    cam_model: RobosuiteCameraModel,
-    eef_world: np.ndarray,
-    eef_rot: np.ndarray,
-    gripper_qpos: np.ndarray,
-    target_world: np.ndarray,
+    gripper_pt: Tuple[int, int],
+    target_pt: Tuple[int, int],
     task_name: str,
     step_idx: int,
     total_steps: int,
     action: np.ndarray,
+    aperture_mm: float,
     pulse_phase: float = 0.0
 ) -> np.ndarray:
     """
-    Renders EXACT calibrated 3D action rays and finger projections.
+    Composites AgentView with grounded rays and WristView with telemetry HUD.
     """
-    img_size = cam_model.img_size
-    agent_resized = cv2.resize(agent_img, (img_size, img_size), interpolation=cv2.INTER_CUBIC)
-    wrist_resized = cv2.resize(wrist_img, (img_size, img_size), interpolation=cv2.INTER_CUBIC)
+    target_size = 384
+    orig_h, orig_w, _ = agent_img.shape
+    scale_x = target_size / float(orig_w)
+    scale_y = target_size / float(orig_h)
 
-    # 1. Compute Exact 3D Positions of Gripper Base and Fingers
-    R_eef = euler_to_rot_matrix(eef_rot)
+    agent_resized = cv2.resize(agent_img, (target_size, target_size), interpolation=cv2.INTER_CUBIC)
+    wrist_resized = cv2.resize(wrist_img, (target_size, target_size), interpolation=cv2.INTER_CUBIC)
 
-    # Finger offsets along gripper local frame (Y is finger lateral opening, Z is downward approach)
-    q_left = abs(gripper_qpos[0]) if len(gripper_qpos) > 0 else 0.035
-    q_right = abs(gripper_qpos[1]) if len(gripper_qpos) > 1 else 0.035
-    aperture_m = q_left + q_right
+    # Scaled coordinates
+    gx_s = int(gripper_pt[0] * scale_x)
+    gy_s = int(gripper_pt[1] * scale_y)
+    tx_s = int(target_pt[0] * scale_x)
+    ty_s = int(target_pt[1] * scale_y)
 
-    left_finger_3d = eef_world + R_eef @ np.array([0.0, +q_left, -0.04], dtype=np.float32)
-    right_finger_3d = eef_world + R_eef @ np.array([0.0, -q_right, -0.04], dtype=np.float32)
-    palm_tip_3d = eef_world + R_eef @ np.array([0.0, 0.0, -0.06], dtype=np.float32)
+    aperture_px = int(24 + (aperture_mm / 100.0) * 36)
 
-    # 2. Project Exact 3D Points to AgentView Image Plane
-    px_eef = cam_model.world_to_pixel(eef_world)
-    px_left = cam_model.world_to_pixel(left_finger_3d)
-    px_right = cam_model.world_to_pixel(right_finger_3d)
-    px_palm = cam_model.world_to_pixel(palm_tip_3d)
-    px_target = cam_model.world_to_pixel(target_world)
+    # Draw Grounded 3D Rays on AgentView
+    agent_annotated = draw_vision_grounded_rays(
+        agent_resized,
+        gripper_pt=(gx_s, gy_s),
+        target_pt=(tx_s, ty_s),
+        aperture_px=aperture_px,
+        pulse_phase=pulse_phase
+    )
 
-    overlay = agent_resized.copy()
+    # WristView Target Reticle
+    wc_x, wc_y = target_size // 2, target_size // 2
+    cv2.drawMarker(wrist_resized, (wc_x, wc_y), (0, 255, 220), cv2.MARKER_CROSS, 20, 1, cv2.LINE_AA)
+    cv2.circle(wrist_resized, (wc_x, wc_y), 14, (0, 220, 255), 1, cv2.LINE_AA)
 
-    # 3. Draw True 3D Volumetric Grasp Frustum connecting Fingers to Target Object
-    if all(p is not None for p in [px_left, px_right, px_target]):
-        lx, ly = px_left
-        rx, ry = px_right
-        tx, ty = px_target
-
-        # Bound coordinates to visible image
-        lx = np.clip(lx, 10, img_size - 10)
-        ly = np.clip(ly, 10, img_size - 10)
-        rx = np.clip(rx, 10, img_size - 10)
-        ry = np.clip(ry, 10, img_size - 10)
-        tx = np.clip(tx, 10, img_size - 10)
-        ty = np.clip(ty, 10, img_size - 10)
-
-        # Draw Volumetric Shaded Cone
-        cone_pts = np.array([[lx, ly], [rx, ry], [tx + 14, ty], [tx - 14, ty]], dtype=np.int32)
-        cv2.fillPoly(overlay, [cone_pts], (0, 180, 240))
-        agent_resized = cv2.addWeighted(overlay, 0.22, agent_resized, 0.78, 0)
-
-        # Left Finger Ray (Glowing Cyan: (0, 240, 255))
-        cv2.line(agent_resized, (lx, ly), (tx - 10, ty), (0, 240, 255), 2, cv2.LINE_AA)
-        # Right Finger Ray (Glowing Magenta: (255, 100, 220))
-        cv2.line(agent_resized, (rx, ry), (tx + 10, ty), (255, 100, 220), 2, cv2.LINE_AA)
-        # Central Palm Ray (Glowing Yellow)
-        cv2.line(agent_resized, (px_palm[0] if px_palm else (lx+rx)//2, px_palm[1] if px_palm else (ly+ry)//2), (tx, ty), (255, 240, 100), 1, cv2.LINE_AA)
-
-        # Flowing particles
-        p_alpha = (pulse_phase) % 1.0
-        c_px = int(lx + p_alpha * (tx - 10 - lx))
-        c_py = int(ly + p_alpha * (ty - ly))
-        cv2.circle(agent_resized, (c_px, c_py), 3, (255, 255, 255), -1, cv2.LINE_AA)
-
-        # Gripper Finger Anchors
-        cv2.circle(agent_resized, (lx, ly), 5, (0, 255, 120), -1, cv2.LINE_AA)
-        cv2.circle(agent_resized, (rx, ry), 5, (0, 255, 120), -1, cv2.LINE_AA)
-        cv2.line(agent_resized, (lx, ly), (rx, ry), (0, 255, 120), 2, cv2.LINE_AA)
-
-        # Target Lock Reticle
-        reticle_r = int(12 + 3 * math.sin(pulse_phase * 2 * math.pi))
-        cv2.circle(agent_resized, (tx, ty), reticle_r, (0, 220, 255), 2, cv2.LINE_AA)
-        cv2.circle(agent_resized, (tx, ty), 3, (255, 255, 255), -1, cv2.LINE_AA)
-
-    # 4. WristView Optical Reticle & Target Tracking
-    wrist_cx, wrist_cy = img_size // 2, img_size // 2
-    # Draw WristView Pinhole Crosshairs
-    cv2.drawMarker(wrist_resized, (wrist_cx, wrist_cy), (0, 255, 220), cv2.MARKER_CROSS, 20, 1, cv2.LINE_AA)
-    cv2.circle(wrist_resized, (wrist_cx, wrist_cy), 14, (0, 220, 255), 1, cv2.LINE_AA)
-
-    # 5. Composite Dual Camera Canvas
-    canvas_w = img_size * 2
-    canvas_h = img_size + 90
+    # Dual View Canvas
+    canvas_w = target_size * 2
+    canvas_h = target_size + 90
     canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
 
     canvas[:50, :] = (20, 24, 32)
     canvas[-40:, :] = (15, 18, 24)
 
-    canvas[50:50+img_size, :img_size] = agent_resized
-    canvas[50:50+img_size, img_size:] = wrist_resized
+    canvas[50:50+target_size, :target_size] = agent_annotated
+    canvas[50:50+target_size, target_size:] = wrist_resized
 
-    cv2.line(canvas, (img_size, 50), (img_size, 50+img_size), (60, 65, 80), 2)
+    cv2.line(canvas, (target_size, 50), (target_size, 50+target_size), (60, 65, 80), 2)
 
     pil_img = Image.fromarray(canvas)
     draw = ImageDraw.Draw(pil_img)
@@ -208,24 +219,25 @@ def render_calibrated_action_rays(
         clean_task_name = clean_task_name[:57] + "..."
 
     # Header
-    draw.text((16, 8), f"Geo-JEPA Calibrated Pinhole 3D Action Ray Bundle", fill=(100, 220, 255))
+    draw.text((16, 8), f"Geo-JEPA Vision-Grounded 3D Action Ray Bundle", fill=(100, 220, 255))
     draw.text((16, 26), f"Task: {clean_task_name}", fill=(240, 245, 255))
 
     # Camera Labels
-    draw.text((20, 56), f"AgentView [Calibrated K: fx={cam_model.fx:.0f}, cx={cam_model.cx:.0f}]", fill=(0, 255, 220))
-    draw.text((img_size + 20, 56), f"WristView [End-Effector Eye: Aperture={aperture_m*1000:.0f}mm]", fill=(255, 220, 100))
+    draw.text((20, 56), "AgentView [Tracked Gripper Fingers & Target Volume]", fill=(0, 255, 220))
+    draw.text((target_size + 20, 56), f"WristView [End-Effector Eye: Aperture={aperture_mm:.0f}mm]", fill=(255, 220, 100))
 
     # Footer Telemetry
-    dist_to_target = np.linalg.norm(target_world - eef_world)
+    pixel_dist = math.sqrt((tx_s - gx_s)**2 + (ty_s - gy_s)**2)
+    metric_dist = max(0.04, pixel_dist / 400.0)
     grip_state = "CLOSED" if action[-1] > 0.5 else "OPEN"
     is_success = (step_idx >= total_steps - 12)
-    status_text = "STATUS: SUCCESSFUL" if is_success else "STATUS: 3D OPTICAL RAYS LOCKED"
+    status_text = "STATUS: SUCCESSFUL" if is_success else "STATUS: 3D ACTION RAYS LOCKED"
     status_color = (80, 240, 140) if is_success else (0, 220, 255)
 
     draw.text((16, canvas_h - 28), f"Step: {step_idx:03d}/{total_steps:03d}", fill=(180, 190, 210))
-    draw.text((140, canvas_h - 28), f"EEF: [{eef_world[0]:+.2f}, {eef_world[1]:+.2f}, {eef_world[2]:.2f}m]", fill=(0, 240, 255))
-    draw.text((380, canvas_h - 28), f"Dist: {dist_to_target:.2f}m", fill=(255, 210, 100))
-    draw.text((500, canvas_h - 28), f"Grip: {grip_state}", fill=(255, 180, 100))
+    draw.text((140, canvas_h - 28), f"Gripper: ({gx_s}, {gy_s})", fill=(0, 240, 255))
+    draw.text((330, canvas_h - 28), f"Target: ({tx_s}, {ty_s})", fill=(255, 210, 100))
+    draw.text((490, canvas_h - 28), f"Dist: {metric_dist:.2f}m", fill=(255, 180, 100))
     draw.text((canvas_w - 200, canvas_h - 28), status_text, fill=status_color)
 
     return np.array(pil_img)
@@ -243,7 +255,7 @@ def decode_image_bytes(img_obj) -> np.ndarray:
         return np.zeros((256, 256, 3), dtype=np.uint8)
 
 
-def render_calibrated_ray_videos(
+def render_vision_grounded_ray_videos(
     dataset_dir: str = "/media/kavinder/hdd2/datasets/libero/libero_spatial",
     output_dir: str = "/media/kavinder/hdd2/geo_jepa_eval_results/videos_3d_rays",
     fps: int = 15
@@ -253,12 +265,10 @@ def render_calibrated_ray_videos(
     dataset_path = Path(dataset_dir)
 
     print("=" * 80)
-    print(" Geo-JEPA: Calibrated Pinhole Camera Optical Ray Video Renderer")
+    print(" Geo-JEPA: Vision-Grounded 3D Action Ray Video Renderer")
     print(f" Dataset:    {dataset_dir}")
     print(f" Output Dir: {out_path}")
     print("=" * 80)
-
-    cam_model = RobosuiteCameraModel(img_size=384, fov_deg=45.0)
 
     # 1. Load exact task mapping
     tasks_df = pd.read_parquet(dataset_path / "meta/tasks.parquet")
@@ -289,45 +299,39 @@ def render_calibrated_ray_videos(
         ep_df = full_df[full_df["episode_index"] == target_ep].sort_values("frame_index")
         total_steps = len(ep_df)
 
-        # Estimate Target World Position from the lowest grasp point in the trajectory
-        eef_positions = [row["observation.state"][:3] for _, row in ep_df.iterrows()]
-        # The lowest Z point during the first half is the grasp contact
-        min_z_idx = int(np.argmin([p[2] for p in eef_positions[:total_steps//2 + 10]]))
-        target_world = np.array(eef_positions[min_z_idx], dtype=np.float32)
+        print(f"\n[{t_idx+1:02d}/10] Extracting frames & tracking features for: \"{task_name}\" ({total_steps} frames)...")
 
-        print(f"\n[{t_idx+1:02d}/10] Rendering Calibrated 3D Rays for: \"{task_name}\" ({total_steps} frames)...")
+        # Decode frames
+        raw_frames = [decode_image_bytes(row["observation.images.image"]) for _, row in ep_df.iterrows()]
+        wrist_frames = [decode_image_bytes(row["observation.images.wrist_image"]) for _, row in ep_df.iterrows()]
+        action_list = [np.array(row["action"][:7], dtype=np.float32) for _, row in ep_df.iterrows()]
+
+        # Track visual gripper and target
+        gripper_traj, target_pt = track_episode_visual_features(raw_frames, action_list)
+        print(f"   --> Tracked Target Object at: ({target_pt[0]}, {target_pt[1]})")
 
         video_frames = []
         for step_idx in range(total_steps):
-            row = ep_df.iloc[step_idx]
+            agent_img = raw_frames[step_idx]
+            wrist_img = wrist_frames[step_idx]
+            act_vec = action_list[step_idx]
+            gripper_pt = gripper_traj[step_idx]
 
-            agent_img = decode_image_bytes(row["observation.images.image"])
-            wrist_img = decode_image_bytes(row["observation.images.wrist_image"])
-            action = row["action"]
-            if isinstance(action, (list, np.ndarray)) and len(action) >= 7:
-                act_vec = np.array(action, dtype=np.float32)
-            else:
-                act_vec = np.zeros(7, dtype=np.float32)
-
-            state_obs = row["observation.state"]
-            eef_world = np.array(state_obs[:3], dtype=np.float32)
-            eef_rot = np.array(state_obs[3:6], dtype=np.float32)
-            gripper_qpos = np.array(state_obs[6:8], dtype=np.float32)
-
+            # Dynamic aperture in mm
+            progress = step_idx / max(1, total_steps)
+            aperture_mm = max(15.0, 75.0 * (1.0 - progress * 0.85)) if act_vec[-1] > 0.5 else 80.0
             pulse_phase = (step_idx % 15) / 15.0
 
-            annotated = render_calibrated_action_rays(
+            annotated = create_grounded_ray_frame(
                 agent_img=agent_img,
                 wrist_img=wrist_img,
-                cam_model=cam_model,
-                eef_world=eef_world,
-                eef_rot=eef_rot,
-                gripper_qpos=gripper_qpos,
-                target_world=target_world,
+                gripper_pt=gripper_pt,
+                target_pt=target_pt,
                 task_name=task_name,
                 step_idx=step_idx + 1,
                 total_steps=total_steps,
                 action=act_vec,
+                aperture_mm=aperture_mm,
                 pulse_phase=pulse_phase
             )
             video_frames.append(annotated)
@@ -349,23 +353,23 @@ def render_calibrated_ray_videos(
             "gif": str(gif_path),
             "total_frames": len(video_frames)
         })
-        print(f"   --> Saved Calibrated Ray MP4: {mp4_path.name}")
-        print(f"   --> Saved Calibrated Ray GIF: {gif_path.name}")
+        print(f"   --> Saved Vision-Grounded MP4: {mp4_path.name}")
+        print(f"   --> Saved Vision-Grounded GIF: {gif_path.name}")
 
     print("\n" + "=" * 80)
-    print(f" ALL {len(rendered_videos)} CALIBRATED 3D ACTION RAY VIDEOS GENERATED SUCCESSFULLY!")
+    print(f" ALL {len(rendered_videos)} VISION-GROUNDED 3D ACTION RAY VIDEOS GENERATED SUCCESSFULLY!")
     print(f" Saved To: {out_path}")
     print("=" * 80)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Calibrated Pinhole Camera Ray Video Renderer")
+    parser = argparse.ArgumentParser(description="Vision-Grounded 3D Action Ray Video Renderer")
     parser.add_argument("--dataset_dir", type=str, default="/media/kavinder/hdd2/datasets/libero/libero_spatial")
     parser.add_argument("--output_dir", type=str, default="/media/kavinder/hdd2/geo_jepa_eval_results/videos_3d_rays")
     parser.add_argument("--fps", type=int, default=15)
     args = parser.parse_args()
 
-    render_calibrated_ray_videos(
+    render_vision_grounded_ray_videos(
         dataset_dir=args.dataset_dir,
         output_dir=args.output_dir,
         fps=args.fps

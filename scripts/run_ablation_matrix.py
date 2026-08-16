@@ -161,7 +161,7 @@ class AblationPolicy(nn.Module):
             # Full Coupled Joint Flow (u = [a, delta_p] in R^(8 x 135))
             self.coupled_flow = CoupledGeoActionFlow(
                 action_dim=action_dim,
-                num_points=num_points,
+                point_dim=num_points * 2,
                 horizon=action_horizon,
                 cond_dim=embed_dim,
                 hidden_dim=384,
