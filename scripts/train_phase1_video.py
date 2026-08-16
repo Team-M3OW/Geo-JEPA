@@ -143,7 +143,14 @@ class GeoJEPAPhase1VideoModel(nn.Module):
         }
 
 
-def run_phase1_pretraining(config_path: str, max_steps: int = 2000):
+def run_phase1_pretraining(
+    config_path: str,
+    max_steps: int = 2000,
+    use_wandb: bool = True,
+    wandb_project: str = "Geo-JEPA",
+    wandb_entity: Optional[str] = None,
+    wandb_run_name: Optional[str] = None
+):
     cfg = OmegaConf.load(config_path)
     output_dir = Path(cfg.run_root_dir) / cfg.run_id
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -155,7 +162,20 @@ def run_phase1_pretraining(config_path: str, max_steps: int = 2000):
     print(f" Config:       {config_path}")
     print(f" Total Steps:  {max_steps} | Batch Size: {cfg.datasets.video_data.per_device_batch_size}")
     print(f" Output Dir:   {output_dir}")
+    print(f" WandB:        {'Enabled' if use_wandb else 'Disabled'} (Project: {wandb_project})")
     print("=" * 75)
+
+    # Initialize WandB
+    if use_wandb:
+        import wandb
+        run_name = wandb_run_name or f"phase1_{cfg.run_id}_{int(time.time())}"
+        wandb.init(
+            project=wandb_project,
+            entity=wandb_entity,
+            name=run_name,
+            config=OmegaConf.to_container(cfg, resolve=True),
+            tags=["phase1", "video_pretrain", "geo_jepa"]
+        )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = GeoJEPAPhase1VideoModel(cfg, device=device)
@@ -226,6 +246,20 @@ def run_phase1_pretraining(config_path: str, max_steps: int = 2000):
         }
         history.append(log_data)
 
+        # Log to WandB
+        if use_wandb:
+            import wandb
+            wandb.log({
+                "train/total_loss": losses["total_loss"].item(),
+                "train/wm_loss_sem": losses["wm_sem"].item(),
+                "train/wm_loss_geo": losses["wm_geo"].item(),
+                "train/geo_align_loss": losses["geo_align"].item(),
+                "hyperparams/alpha": alpha,
+                "hyperparams/gamma": gamma,
+                "hyperparams/beta": beta,
+                "train/step": step,
+            }, step=step)
+
         if step % 100 == 0 or step == max_steps or step == 10:
             print(f" Step {step:04d}/{max_steps:04d} | Total: {log_data['total_loss']:.4f} | "
                   f"WM_Sem (β={beta}): {log_data['wm_sem']:.4f} | "
@@ -246,6 +280,10 @@ def run_phase1_pretraining(config_path: str, max_steps: int = 2000):
     with open(log_file, "w") as f:
         json.dump(history, f, indent=2)
 
+    if use_wandb:
+        import wandb
+        wandb.finish()
+
     elapsed = time.time() - t_start
     print(f"\n" + "=" * 75)
     print(f" Phase 1 Video Pretraining Complete!")
@@ -259,5 +297,18 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Geo-JEPA Phase 1 Video Pretraining")
     parser.add_argument("--config", type=str, default="/home/kavinder/Geo-JEPA/configs/phase1_video_pretrain.yaml")
     parser.add_argument("--steps", type=int, default=2000)
+    parser.add_argument("--wandb", action="store_true", default=True, help="Enable Weights & Biases logging")
+    parser.add_argument("--no_wandb", action="store_false", dest="wandb", help="Disable Weights & Biases logging")
+    parser.add_argument("--wandb_project", type=str, default="Geo-JEPA")
+    parser.add_argument("--wandb_entity", type=str, default=None)
+    parser.add_argument("--wandb_name", type=str, default=None)
     args = parser.parse_args()
-    run_phase1_pretraining(args.config, max_steps=args.steps)
+    
+    run_phase1_pretraining(
+        config_path=args.config,
+        max_steps=args.steps,
+        use_wandb=args.wandb,
+        wandb_project=args.wandb_project,
+        wandb_entity=args.wandb_entity,
+        wandb_run_name=args.wandb_name
+    )
