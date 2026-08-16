@@ -110,6 +110,12 @@ def interpolate_pooling(
     patch_h, patch_w = patch_hw
     img_h, img_w = img_hw
     
+    # Auto-adjust patch_hw if S is a square grid (e.g. 1369 => 37x37)
+    if patch_h * patch_w != S:
+        side = int(np.round(np.sqrt(S)))
+        if side * side == S:
+            patch_h, patch_w = side, side
+    
     # Calculate target spatial grid
     target_tokens_per_view = target_num_tokens // N if (target_num_tokens % N == 0) else target_num_tokens
     target_side = int(np.round(np.sqrt(target_tokens_per_view)))

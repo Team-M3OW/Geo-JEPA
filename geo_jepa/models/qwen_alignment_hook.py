@@ -123,9 +123,19 @@ class QwenGeometricAlignmentHook(nn.Module):
         if not vis_mask.any():
             return torch.tensor(0.0, device=vlm_vis_tokens.device, requires_grad=True)
             
-        # Ensure VGGT features have (B, N_views, S_patches, D)
+        # Ensure VGGT features match VLM batch size and (B, N_views, S_patches, D)
+        B_vlm = vlm_vis_tokens.shape[0]
         if vggt_current_features.dim() == 3:
-            vggt_current_features = vggt_current_features.unsqueeze(1)  # (B, 1, S_patches, D)
+            if vggt_current_features.shape[0] != B_vlm:
+                # Features are (N_views, S_patches, D)
+                vggt_current_features = vggt_current_features.unsqueeze(0).expand(B_vlm, -1, -1, -1)
+            else:
+                # Features are (B, S_patches, D)
+                vggt_current_features = vggt_current_features.unsqueeze(1)
+        elif vggt_current_features.dim() == 4:
+            if vggt_current_features.shape[0] != B_vlm:
+                reps = (B_vlm // vggt_current_features.shape[0]) + 1
+                vggt_current_features = vggt_current_features.repeat(reps, 1, 1, 1)[:B_vlm]
             
         B, N_views, S_patches, D_vggt = vggt_current_features.shape
         target_num_tokens = vlm_vis_tokens.shape[1]
