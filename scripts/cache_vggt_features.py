@@ -234,7 +234,8 @@ def main():
     print(f" Projected Corpus Footprint Estimates:")
     print(f"   - LIBERO (approx. 500 demos):        ~ {500 * avg_mb_per_clip / 1024:.2f} GB")
     print(f"   - DROID (76K trajectories, subseq):   ~ {76000 * avg_mb_per_clip / 1024:.2f} GB")
-    print(f"   - SSv2 (220K human clips, 1-view):    ~ {220000 * (avg_mb_per_clip / (2 if num_views==2 else 1)) / 1024:.2f} GB")
+    views_factor = 2 if args.dataset_name != "ssv2" else 1
+    print(f"   - SSv2 (220K human clips, 1-view):    ~ {220000 * (avg_mb_per_clip / views_factor) / 1024:.2f} GB")
     print(f" Available Storage on /media/kavinder/hdd2: 2.9 TB")
     print(f"===============================================================")
 
