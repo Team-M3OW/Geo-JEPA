@@ -169,14 +169,38 @@ def main():
     num_samples = args.sample_limit if args.sample_limit is not None else 50
     print(f"\nRunning caching verification over {num_samples} sample clips...")
 
+    # If dataset is libero and input dir exists, load real frames from LiberoLeRobotDataset
+    libero_ds = None
+    if args.dataset_name == "libero":
+        libero_path = Path(args.input_dir or "/media/kavinder/hdd2/datasets/libero/libero_spatial")
+        if libero_path.exists():
+            print(f"Loading real LIBERO demonstrations from: {libero_path}")
+            from geo_jepa.dataloader.libero_dataset import LiberoLeRobotDataset
+            libero_ds = LiberoLeRobotDataset(libero_path, action_horizon=args.window_future_t)
+
     total_bytes = 0
     times = []
 
     for i in tqdm(range(num_samples), desc="Caching clips"):
-        # Synthetic / mock clip generation for verification
-        # Number of views: 1 for SSv2 (monocular), 2 for DROID/LIBERO (multi-view)
-        num_views = 1 if args.dataset_name == "ssv2" else 2
-        clip = generate_synthetic_clip(seq_len=total_window_len, num_views=num_views)
+        if libero_ds is not None and i < len(libero_ds):
+            # Extract real dual-view frames
+            sample = libero_ds[i]
+            # images: [agentview_PIL, wristview_PIL]
+            imgs = sample["image"]
+            # Convert to (V=2, S=total_window_len, C=3, H=518, W=518)
+            v_tensors = []
+            for img in imgs:
+                img_resized = img.resize((args.vggt_img_size, args.vggt_img_size), Image.BILINEAR)
+                arr = np.array(img_resized).astype(np.float32) / 255.0  # (H, W, 3)
+                t_single = torch.tensor(arr).permute(2, 0, 1).unsqueeze(0)  # (1, 3, H, W)
+                # Repeat across window dimension
+                t_win = t_single.repeat(total_window_len, 1, 1, 1)  # (S, 3, H, W)
+                v_tensors.append(t_win)
+            clip = torch.stack(v_tensors, dim=0)  # (V=2, S, 3, H, W)
+        else:
+            # Synthetic fallback
+            num_views = 1 if args.dataset_name == "ssv2" else 2
+            clip = generate_synthetic_clip(seq_len=total_window_len, num_views=num_views)
         
         t0 = time.time()
         cached_features = process_video_window(
