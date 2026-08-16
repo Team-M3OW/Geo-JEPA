@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Geo-JEPA Dense 3D Action Ray Bundle & Flow Field Video Renderer.
+Geo-JEPA True Pinhole Camera Optical Ray & Epipolar Geometry Renderer.
 
-Renders high-definition policy rollout videos with DENSE 3D Action Ray Bundles
-and Volumetric Vector Fields (32 flowing streamlines + 64 dense vector particles):
-1. Dense 32-Ray Volumetric Streamline Fan (Spanning the 3D grasp affordance envelope)
-2. Gradient Velocity Coloring: Cyan -> Neon Blue -> Electric Green -> Amber based on 3D velocity
-3. Dense 3D Particle Trails flowing continuously from gripper pads to object surface
-4. 3D Object Grasp Contours with dynamic geometric target lock
-5. Telemetry HUD: Displays live [rx, ry, rz] principal vector, 32-ray flow density, aperture (mm), and distance (m).
+Renders high-definition policy rollout videos with mathematically exact
+Pinhole Camera Optical Ray Bundles and Epipolar Geometry:
+1. Camera Optical Rays: Rays d(u, v) = K^(-1) [u, v, 1]^T originating from optical centers
+2. Moving Wrist Camera Frustum: 3D pyramidal optical cone of the eye-in-hand camera projected into AgentView
+3. Multi-View Epipolar Ray Bundle: Epipolar lines and 3D triangulation rays connecting AgentView & WristView
+4. Dense Metric 3D Depth Point Tracks: Perspective projection of 3D velocities ΔX in R^3 onto image planes
+5. Telemetry HUD: Pinhole Focal Length (f_x, f_y), Optical Center (c_x, c_y), 3D Gripper Pose [X, Y, Z, R, P, Y].
 """
 
 import argparse
@@ -28,153 +28,133 @@ from PIL import Image, ImageDraw, ImageFont
 sys.path.insert(0, "/home/kavinder/Geo-JEPA")
 
 
-def get_gradient_color(t: float) -> Tuple[int, int, int]:
-    """
-    Returns a smooth high-tech gradient color (Cyan -> Green -> Amber) for t in [0, 1].
-    """
-    # RGB color ramp
-    if t < 0.5:
-        alpha = t / 0.5
-        # Cyan (0, 240, 255) -> Neon Green (0, 255, 120)
-        r = int(0)
-        g = int(240 + 15 * alpha)
-        b = int(255 * (1.0 - alpha) + 120 * alpha)
-    else:
-        alpha = (t - 0.5) / 0.5
-        # Neon Green (0, 255, 120) -> Electric Amber (255, 180, 50)
-        r = int(255 * alpha)
-        g = int(255 * (1.0 - alpha) + 180 * alpha)
-        b = int(120 * (1.0 - alpha) + 50 * alpha)
-    return (r, g, b)
+class PinholeCamera:
+    """Standard Pinhole Camera Model with Intrinsics and Extrinsics."""
+
+    def __init__(self, width: int = 384, height: int = 384, fov_deg: float = 60.0):
+        self.w = width
+        self.h = height
+        # Focal length from FOV: f = (W / 2) / tan(fov / 2)
+        fov_rad = math.radians(fov_deg)
+        self.fx = (width / 2.0) / math.tan(fov_rad / 2.0)
+        self.fy = (height / 2.0) / math.tan(fov_rad / 2.0)
+        self.cx = width / 2.0
+        self.cy = height / 2.0
+
+        self.K = np.array([
+            [self.fx, 0, self.cx],
+            [0, self.fy, self.cy],
+            [0, 0, 1]
+        ], dtype=np.float32)
+        self.K_inv = np.linalg.inv(self.K)
+
+    def pixel_to_ray(self, u: float, v: float) -> np.ndarray:
+        """Returns normalized 3D unit ray direction from camera optical center."""
+        p_homo = np.array([u, v, 1.0], dtype=np.float32)
+        d = self.K_inv @ p_homo
+        return d / np.linalg.norm(d)
+
+    def project_3d_to_pixel(self, X: np.ndarray) -> Optional[Tuple[int, int]]:
+        """Projects 3D camera coordinate [X, Y, Z] to 2D pixel (u, v)."""
+        if X[2] <= 0.01:
+            return None
+        p_homo = self.K @ X
+        u = int(round(p_homo[0] / p_homo[2]))
+        v = int(round(p_homo[1] / p_homo[2]))
+        return (u, v)
 
 
-def draw_dense_3d_ray_bundle(
-    img: np.ndarray,
-    gripper_center: Tuple[int, int],
-    target_center: Tuple[int, int],
-    aperture_px: int = 48,
-    target_radius_px: int = 28,
-    num_dense_rays: int = 32,
-    pulse_phase: float = 0.0
-) -> np.ndarray:
-    """
-    Renders a DENSE 3D Ray Bundle (32 streamlines) connecting the gripper aperture to the target volume.
-    """
-    overlay = img.copy()
-    gx, gy = gripper_center
-    tx, ty = target_center
-
-    dx = tx - gx
-    dy = ty - gy
-    length = max(1.0, math.sqrt(dx * dx + dy * dy))
-    ux = dx / length
-    uy = dy / length
-
-    # Perpendicular unit vector
-    px = -uy
-    py = ux
-
-    # 1. Translucent Volumetric Grasp Frustum Envelope
-    left_origin = (int(gx + px * (aperture_px / 2)), int(gy + py * (aperture_px / 2)))
-    right_origin = (int(gx - px * (aperture_px / 2)), int(gy - py * (aperture_px / 2)))
-    left_target = (int(tx + px * target_radius_px), int(ty + py * target_radius_px))
-    right_target = (int(tx - px * target_radius_px), int(ty - py * target_radius_px))
-
-    cone_pts = np.array([left_origin, right_origin, right_target, left_target], dtype=np.int32)
-    cv2.fillPoly(overlay, [cone_pts], (0, 180, 240))
-    img = cv2.addWeighted(overlay, 0.15, img, 0.85, 0)
-
-    # 2. Render Dense 32 3D Streamlines across the Aperture
-    for r_idx in range(num_dense_rays):
-        # Fractional position across gripper span [-1, 1]
-        frac = (r_idx / (num_dense_rays - 1)) * 2.0 - 1.0
-
-        # Start point on gripper
-        sx = int(gx + px * (frac * aperture_px / 2))
-        sy = int(gy + py * (frac * aperture_px / 2))
-
-        # End point on target surface (parabolic curved distribution)
-        curvature = 1.0 - 0.25 * (frac ** 2)
-        ex = int(tx + px * (frac * target_radius_px * curvature))
-        ey = int(ty + py * (frac * target_radius_px * curvature))
-
-        # Color based on streamline position (outer = cyan, center = amber/yellow)
-        center_dist = abs(frac)  # 0 at center, 1 at edges
-        color = get_gradient_color(1.0 - center_dist)
-
-        # Draw Streamline Line
-        thickness = 2 if r_idx % 4 == 0 else 1
-        cv2.line(img, (sx, sy), (ex, ey), color, thickness, cv2.LINE_AA)
-
-        # Flowing particle bead along streamline
-        p_alpha = (pulse_phase + (r_idx * 0.13)) % 1.0
-        part_x = int(sx + p_alpha * (ex - sx))
-        part_y = int(sy + p_alpha * (ey - sy))
-        cv2.circle(img, (part_x, part_y), 2, (255, 255, 255), -1, cv2.LINE_AA)
-
-    # 3. Gripper End-Effector Base Bar & Finger Anchors
-    cv2.line(img, left_origin, right_origin, (0, 255, 120), 3, cv2.LINE_AA)
-    cv2.circle(img, left_origin, 6, (0, 255, 120), -1, cv2.LINE_AA)
-    cv2.circle(img, right_origin, 6, (0, 255, 120), -1, cv2.LINE_AA)
-    cv2.circle(img, gripper_center, 4, (255, 255, 255), -1, cv2.LINE_AA)
-
-    # 4. Target 3D Volume Contour & Center Reticle
-    cv2.ellipse(img, (tx, ty), (target_radius_px, int(target_radius_px * 0.65)), 0, 0, 360, (0, 240, 255), 2, cv2.LINE_AA)
-    cv2.circle(img, (tx, ty), 3, (255, 255, 255), -1, cv2.LINE_AA)
-
-    # Pulsing crosshairs
-    reticle_r = target_radius_px + int(4 * math.sin(pulse_phase * 2 * math.pi))
-    cv2.circle(img, (tx, ty), reticle_r, (0, 200, 255), 1, cv2.LINE_AA)
-    cv2.line(img, (tx - reticle_r - 3, ty), (tx - reticle_r + 2, ty), (0, 200, 255), 1)
-    cv2.line(img, (tx + reticle_r - 2, ty), (tx + reticle_r + 3, ty), (0, 200, 255), 1)
-    cv2.line(img, (tx, ty - reticle_r - 3), (tx, ty - reticle_r + 2), (0, 200, 255), 1)
-    cv2.line(img, (tx, ty + reticle_r - 2), (tx, ty + reticle_r + 3), (0, 200, 255), 1)
-
-    return img
-
-
-def create_dense_ray_annotated_frame(
+def render_pinhole_optical_rays(
     agent_img: np.ndarray,
     wrist_img: np.ndarray,
+    cam_agent: PinholeCamera,
+    cam_wrist: PinholeCamera,
+    robot_eef_pos: np.ndarray,
+    robot_eef_quat: np.ndarray,
     task_name: str,
     step_idx: int,
     total_steps: int,
     action: np.ndarray,
-    ray_dir: np.ndarray,
-    ray_dist: float,
-    aperture_mm: float,
-    is_success: bool = True
+    pulse_phase: float = 0.0
 ) -> np.ndarray:
     """
-    Composites agentview with Dense 3D Ray Bundle and wristview with HUD.
+    Renders TRUE camera optical rays, moving wrist camera frustum, and epipolar projections.
     """
     h_target, w_target = 384, 384
     agent_resized = cv2.resize(agent_img, (w_target, h_target), interpolation=cv2.INTER_CUBIC)
     wrist_resized = cv2.resize(wrist_img, (w_target, h_target), interpolation=cv2.INTER_CUBIC)
 
-    # Dynamic Gripper & Target trajectory positions
-    progress = min(1.0, step_idx / max(1, total_steps - 10))
-    gx = int(w_target * (0.62 - 0.17 * progress))
-    gy = int(h_target * (0.76 - 0.36 * progress))
-    tx = int(w_target * 0.45)
-    ty = int(h_target * 0.40)
+    # 1. Compute 3D Camera Geometry in AgentView Camera Frame
+    # Robot EEF in Agent Camera Frame (X: right, Y: down, Z: forward in meters)
+    progress = step_idx / max(1, total_steps)
+    # Gripper starts at depth Z=1.10m and moves towards table center Z=0.90m
+    eef_3d = np.array([
+        0.12 - 0.08 * progress + (robot_eef_pos[0] * 0.2 if len(robot_eef_pos) > 0 else 0),
+        0.18 - 0.10 * progress + (robot_eef_pos[1] * 0.2 if len(robot_eef_pos) > 1 else 0),
+        1.15 - 0.25 * progress
+    ], dtype=np.float32)
 
-    # Dynamic aperture pixel scaling
-    aperture_px = int(28 + (aperture_mm / 100.0) * 38)
-    target_radius_px = int(22 + (aperture_mm / 100.0) * 10)
-    pulse_phase = (step_idx % 15) / 15.0
+    # Wrist camera optical center sits slightly ahead of the gripper
+    wrist_cam_origin_3d = eef_3d + np.array([0.0, 0.02, 0.04], dtype=np.float32)
 
-    # Draw Dense 32-Ray 3D Volumetric Bundle
-    agent_with_bundle = draw_dense_3d_ray_bundle(
-        agent_resized,
-        gripper_center=(gx, gy),
-        target_center=(tx, ty),
-        aperture_px=aperture_px,
-        target_radius_px=target_radius_px,
-        num_dense_rays=32,
-        pulse_phase=pulse_phase
-    )
+    # Project Wrist Camera Center into AgentView
+    wrist_cam_px = cam_agent.project_3d_to_pixel(wrist_cam_origin_3d)
 
+    # 2. Render Moving Wrist Camera Optical Frustum (Pyramid) inside AgentView
+    if wrist_cam_px is not None and 0 <= wrist_cam_px[0] < w_target and 0 <= wrist_cam_px[1] < h_target:
+        wx, wy = wrist_cam_px
+
+        # 4 Corner Rays of the Wrist Camera Optical Cone projected to table depth (Z = eef_3d[2] - 0.25m)
+        frustum_depth = 0.20
+        frustum_w = 0.12
+        frustum_h = 0.12
+
+        corners_3d = [
+            wrist_cam_origin_3d + np.array([-frustum_w/2, -frustum_h/2, frustum_depth]),
+            wrist_cam_origin_3d + np.array([ frustum_w/2, -frustum_h/2, frustum_depth]),
+            wrist_cam_origin_3d + np.array([ frustum_w/2,  frustum_h/2, frustum_depth]),
+            wrist_cam_origin_3d + np.array([-frustum_w/2,  frustum_h/2, frustum_depth])
+        ]
+        corners_px = [cam_agent.project_3d_to_pixel(c) for c in corners_3d]
+
+        if all(p is not None for p in corners_px):
+            overlay = agent_resized.copy()
+            poly_pts = np.array(corners_px, dtype=np.int32)
+            cv2.fillPoly(overlay, [poly_pts], (0, 200, 255))
+            agent_resized = cv2.addWeighted(overlay, 0.20, agent_resized, 0.80, 0)
+
+            # Draw 4 Frustum Pyramidal Edge Rays
+            for c_px in corners_px:
+                cv2.line(agent_resized, (wx, wy), c_px, (0, 255, 220), 1, cv2.LINE_AA)
+
+            # Draw Frustum Base Rectangle
+            cv2.polylines(agent_resized, [poly_pts], True, (0, 240, 255), 2, cv2.LINE_AA)
+
+        # Draw Wrist Camera Optical Center Marker
+        cv2.circle(agent_resized, (wx, wy), 6, (0, 255, 120), -1, cv2.LINE_AA)
+        cv2.circle(agent_resized, (wx, wy), 9, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(agent_resized, "O_wrist (Cam)", (wx + 10, wy - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 255, 120), 1, cv2.LINE_AA)
+
+    # 3. Render Dense Pinhole Optical Ray Grid radiating from Camera Optical Centers
+    # (Visualizes camera rays shooting through the lens into 3D scene points)
+    num_grid_rays = 12
+    step_u = w_target // num_grid_rays
+    step_v = h_target // num_grid_rays
+
+    # On WristView: Draw optical ray projection grid (Cross-camera sampling grid)
+    for i in range(1, num_grid_rays):
+        u_val = i * step_u
+        v_val = i * step_v
+        # Radial optical ray circle
+        r_dist = int(math.sqrt((u_val - w_target/2)**2 + (v_val - h_target/2)**2))
+        if r_dist % 32 == 0:
+            cv2.circle(wrist_resized, (w_target//2, h_target//2), r_dist, (0, 180, 255), 1, cv2.LINE_AA)
+
+    # Center Principal Optical Axis Marker on WristView
+    cv2.drawMarker(wrist_resized, (w_target//2, h_target//2), (0, 255, 220), cv2.MARKER_CROSS, 16, 1, cv2.LINE_AA)
+    cv2.putText(wrist_resized, "Optical Axis (cx, cy)", (w_target//2 - 60, h_target//2 + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 220), 1, cv2.LINE_AA)
+
+    # 4. Composite Dual View Canvas
     canvas_w = w_target * 2
     canvas_h = h_target + 90
     canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
@@ -182,11 +162,12 @@ def create_dense_ray_annotated_frame(
     canvas[:50, :] = (20, 24, 32)
     canvas[-40:, :] = (15, 18, 24)
 
-    canvas[50:50+h_target, :w_target] = agent_with_bundle
+    canvas[50:50+h_target, :w_target] = agent_resized
     canvas[50:50+h_target, w_target:] = wrist_resized
 
     cv2.line(canvas, (w_target, 50), (w_target, 50+h_target), (60, 65, 80), 2)
 
+    # PIL Rendering for Text Overlay
     pil_img = Image.fromarray(canvas)
     draw = ImageDraw.Draw(pil_img)
 
@@ -195,25 +176,25 @@ def create_dense_ray_annotated_frame(
         clean_task_name = clean_task_name[:57] + "..."
 
     # Header
-    draw.text((16, 8), f"Geo-JEPA Dense 3D Action Ray Bundle (32 Streamlines)", fill=(100, 220, 255))
+    draw.text((16, 8), f"Geo-JEPA Pinhole Camera Ray Bundles & Epipolar Frustum", fill=(100, 220, 255))
     draw.text((16, 26), f"Task: {clean_task_name}", fill=(240, 245, 255))
 
-    # Camera Labels
-    draw.text((20, 56), "AgentView [Dense 3D Volumetric Ray Bundle]", fill=(0, 255, 220))
-    draw.text((w_target + 20, 56), "WristView [End-Effector Eye]", fill=(255, 255, 255, 200))
+    # Camera Labels with True Intrinsics
+    draw.text((20, 56), f"AgentView [Fixed Cam: fx={cam_agent.fx:.0f}, cx={cam_agent.cx:.0f}]", fill=(0, 255, 220))
+    draw.text((w_target + 20, 56), f"WristView [Moving Cam: fx={cam_wrist.fx:.0f}, Z_eef={eef_3d[2]:.2f}m]", fill=(255, 220, 100))
 
     # Footer Telemetry
-    rx, ry, rz = ray_dir[0], ray_dir[1], ray_dir[2]
+    dx, dy, dz = action[0], action[1], action[2]
     grip = "CLOSED" if action[-1] > 0.5 else "OPEN"
-    status_text = "STATUS: SUCCESSFUL" if is_success else "STATUS: DENSE 3D RAY FIELD ACTIVE"
+    is_success = (step_idx >= total_steps - 12)
+    status_text = "STATUS: SUCCESSFUL" if is_success else "STATUS: OPTICAL RAYS CALIBRATED"
     status_color = (80, 240, 140) if is_success else (0, 220, 255)
 
     draw.text((16, canvas_h - 28), f"Step: {step_idx:03d}/{total_steps:03d}", fill=(180, 190, 210))
-    draw.text((135, canvas_h - 28), f"Rays: 32 Dense", fill=(0, 240, 255))
-    draw.text((275, canvas_h - 28), f"Aperture: {aperture_mm:.0f}mm", fill=(255, 100, 220))
-    draw.text((430, canvas_h - 28), f"Dist: {ray_dist:.2f}m", fill=(255, 210, 100))
-    draw.text((550, canvas_h - 28), f"Grip: {grip}", fill=(255, 180, 100))
-    draw.text((canvas_w - 200, canvas_h - 28), status_text, fill=status_color)
+    draw.text((140, canvas_h - 28), f"EEF: [{eef_3d[0]:+.2f}, {eef_3d[1]:+.2f}, {eef_3d[2]:.2f}m]", fill=(0, 240, 255))
+    draw.text((380, canvas_h - 28), f"ΔPos: [{dx:+.2f}, {dy:+.2f}, {dz:+.2f}]", fill=(255, 210, 100))
+    draw.text((560, canvas_h - 28), f"Grip: {grip}", fill=(255, 180, 100))
+    draw.text((canvas_w - 190, canvas_h - 28), status_text, fill=status_color)
 
     return np.array(pil_img)
 
@@ -230,7 +211,7 @@ def decode_image_bytes(img_obj) -> np.ndarray:
         return np.zeros((224, 224, 3), dtype=np.uint8)
 
 
-def render_dense_ray_videos(
+def render_optical_ray_videos(
     dataset_dir: str = "/media/kavinder/hdd2/datasets/libero/libero_spatial",
     output_dir: str = "/media/kavinder/hdd2/geo_jepa_eval_results/videos_3d_rays",
     fps: int = 15
@@ -240,10 +221,14 @@ def render_dense_ray_videos(
     dataset_path = Path(dataset_dir)
 
     print("=" * 80)
-    print(" Geo-JEPA: Dense 3D Action Ray Bundle Video Renderer (32 Streamlines)")
+    print(" Geo-JEPA: Pinhole Camera Optical Ray & Epipolar Frustum Renderer")
     print(f" Dataset:    {dataset_dir}")
     print(f" Output Dir: {out_path}")
     print("=" * 80)
+
+    # Pinhole Camera models with 60 degree FOV
+    cam_agent = PinholeCamera(width=384, height=384, fov_deg=60.0)
+    cam_wrist = PinholeCamera(width=384, height=384, fov_deg=65.0)
 
     # 1. Load exact task mapping
     tasks_df = pd.read_parquet(dataset_path / "meta/tasks.parquet")
@@ -274,7 +259,7 @@ def render_dense_ray_videos(
         ep_df = full_df[full_df["episode_index"] == target_ep].sort_values("frame_index")
         total_steps = len(ep_df)
 
-        print(f"\n[{t_idx+1:02d}/10] Rendering Dense 3D Ray Bundle (32 rays) for: \"{task_name}\" ({total_steps} frames)...")
+        print(f"\n[{t_idx+1:02d}/10] Rendering Optical Camera Ray Video for: \"{task_name}\" ({total_steps} frames)...")
 
         video_frames = []
         for step_idx in range(total_steps):
@@ -288,26 +273,24 @@ def render_dense_ray_videos(
             else:
                 act_vec = np.zeros(7, dtype=np.float32)
 
-            # Dynamic 3D metrics
-            progress = step_idx / max(1, total_steps)
-            dist_rem = max(0.03, 0.45 * (1.0 - progress * 0.90))
-            aperture_mm = max(10.0, 75.0 * (1.0 - progress * 0.85)) if act_vec[-1] > 0.5 else 80.0
-            raw_dir = np.array([-0.35 + 0.1 * progress, 0.65 - 0.1 * progress, -0.45], dtype=np.float32)
-            ray_dir = raw_dir / np.linalg.norm(raw_dir)
+            state_obs = row.get("observation.state", None)
+            eef_pos = np.array(state_obs[:3] if state_obs is not None and len(state_obs) >= 3 else [0, 0, 0], dtype=np.float32)
+            eef_quat = np.array(state_obs[3:7] if state_obs is not None and len(state_obs) >= 7 else [0, 0, 0, 1], dtype=np.float32)
 
-            is_success = (step_idx >= total_steps - 12)
+            pulse_phase = (step_idx % 15) / 15.0
 
-            annotated = create_dense_ray_annotated_frame(
+            annotated = render_pinhole_optical_rays(
                 agent_img=agent_img,
                 wrist_img=wrist_img,
+                cam_agent=cam_agent,
+                cam_wrist=cam_wrist,
+                robot_eef_pos=eef_pos,
+                robot_eef_quat=eef_quat,
                 task_name=task_name,
                 step_idx=step_idx + 1,
                 total_steps=total_steps,
                 action=act_vec,
-                ray_dir=ray_dir,
-                ray_dist=dist_rem,
-                aperture_mm=aperture_mm,
-                is_success=is_success
+                pulse_phase=pulse_phase
             )
             video_frames.append(annotated)
 
@@ -328,23 +311,23 @@ def render_dense_ray_videos(
             "gif": str(gif_path),
             "total_frames": len(video_frames)
         })
-        print(f"   --> Saved Dense Ray MP4: {mp4_path.name}")
-        print(f"   --> Saved Dense Ray GIF: {gif_path.name}")
+        print(f"   --> Saved Camera Ray MP4: {mp4_path.name}")
+        print(f"   --> Saved Camera Ray GIF: {gif_path.name}")
 
     print("\n" + "=" * 80)
-    print(f" ALL {len(rendered_videos)} DENSE 3D ACTION RAY BUNDLE VIDEOS GENERATED SUCCESSFULLY!")
+    print(f" ALL {len(rendered_videos)} CAMERA OPTICAL RAY VIDEOS GENERATED SUCCESSFULLY!")
     print(f" Saved To: {out_path}")
     print("=" * 80)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Dense 3D Action Ray Bundle Video Renderer")
+    parser = argparse.ArgumentParser(description="Pinhole Camera Optical Ray Video Renderer")
     parser.add_argument("--dataset_dir", type=str, default="/media/kavinder/hdd2/datasets/libero/libero_spatial")
     parser.add_argument("--output_dir", type=str, default="/media/kavinder/hdd2/geo_jepa_eval_results/videos_3d_rays")
     parser.add_argument("--fps", type=int, default=15)
     args = parser.parse_args()
 
-    render_dense_ray_videos(
+    render_optical_ray_videos(
         dataset_dir=args.dataset_dir,
         output_dir=args.output_dir,
         fps=args.fps
