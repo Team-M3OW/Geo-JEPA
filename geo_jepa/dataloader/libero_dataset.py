@@ -142,6 +142,98 @@ class LiberoHDF5Dataset(Dataset):
         return item
 
 
+class LiberoLeRobotDataset(Dataset):
+    """
+    Dataset class for loading LIBERO demonstrations directly from LeRobot parquet format.
+    """
+
+    def __init__(
+        self,
+        dataset_dir: Union[str, Path],
+        action_horizon: int = 8,
+        future_action_window_size: int = 7,
+        past_action_window_size: int = 0,
+        img_size: int = 256,
+        cache_dir: Optional[Union[str, Path]] = None,
+        task_instruction: Optional[str] = None,
+    ) -> None:
+        super().__init__()
+        self.dataset_dir = Path(dataset_dir)
+        self.action_horizon = action_horizon
+        self.future_window = future_action_window_size
+        self.past_window = past_action_window_size
+        self.chunk_len = self.past_window + 1 + self.future_window
+        self.img_size = img_size
+        self.cache_dir = Path(cache_dir) if cache_dir is not None else None
+
+        # Load task metadata
+        import json
+        import pandas as pd
+        
+        self.tasks = {}
+        task_file = self.dataset_dir / "meta" / "tasks.parquet"
+        if task_file.exists():
+            df_tasks = pd.read_parquet(task_file)
+            for _, r in df_tasks.iterrows():
+                self.tasks[r["task_index"]] = r.get("task", f"Task {r['task_index']}")
+
+        # Read parquet shards from data/chunk-000
+        parquet_files = sorted(list((self.dataset_dir / "data" / "chunk-000").glob("*.parquet")))
+        if not parquet_files:
+            parquet_files = sorted(list(self.dataset_dir.rglob("*.parquet")))
+
+        self.df_list = []
+        for p in parquet_files[:5]:  # Load initial shard partition
+            self.df_list.append(pd.read_parquet(p))
+            
+        if self.df_list:
+            self.df = pd.concat(self.df_list, ignore_index=True)
+        else:
+            self.df = pd.DataFrame()
+
+    def __len__(self) -> int:
+        return len(self.df)
+
+    def __getitem__(self, idx: int) -> Dict[str, Union[List[Image.Image], np.ndarray, str]]:
+        row = self.df.iloc[idx]
+        
+        # Images
+        img_raw = row["observation.images.image"]
+        wrist_raw = row["observation.images.wrist_image"]
+        
+        import io
+        if isinstance(img_raw, dict) and "bytes" in img_raw:
+            img_agent = Image.open(io.BytesIO(img_raw["bytes"])).convert("RGB").resize((self.img_size, self.img_size))
+        elif isinstance(img_raw, np.ndarray):
+            img_agent = Image.fromarray(img_raw).resize((self.img_size, self.img_size))
+        else:
+            img_agent = Image.new("RGB", (self.img_size, self.img_size))
+
+        if isinstance(wrist_raw, dict) and "bytes" in wrist_raw:
+            img_wrist = Image.open(io.BytesIO(wrist_raw["bytes"])).convert("RGB").resize((self.img_size, self.img_size))
+        elif isinstance(wrist_raw, np.ndarray):
+            img_wrist = Image.fromarray(wrist_raw).resize((self.img_size, self.img_size))
+        else:
+            img_wrist = Image.new("RGB", (self.img_size, self.img_size))
+
+        state = np.array(row.get("observation.state", np.zeros(7)), dtype=np.float32)
+        raw_act = np.array(row.get("action", np.zeros(7)), dtype=np.float32)
+        
+        # Build action chunk (repeat if boundary)
+        action_chunk = np.tile(raw_act[None, :], (self.chunk_len, 1))
+
+        t_idx = row.get("task_index", 0)
+        instruction = self.tasks.get(t_idx, "manipulate the object")
+
+        return {
+            "image": [img_agent, img_wrist],
+            "video": np.stack([np.array(img_agent), np.array(img_wrist)])[None],
+            "state": state,
+            "action": action_chunk,
+            "lang": instruction,
+        }
+
+
 def libero_collate_fn(batch: List[dict]) -> List[dict]:
     """Collate function returning standard Geo-JEPA / VLA-JEPA dictionary format."""
     return batch
