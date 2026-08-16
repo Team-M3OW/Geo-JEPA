@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-Geo-JEPA 3D Action Ray Overlay Video Renderer.
+Geo-JEPA Multi-Ray 3D Grasp Bundle Overlay Video Renderer.
 
-Renders high-definition policy rollout videos with explicit 3D Action Ray
-Projections (L_ray) overlaid directly onto the AgentView camera stream:
-- Gripper Tip Anchor: Neon green origin ring
-- 3D Action Ray: Glowing cyan line-of-sight vector connecting gripper to target
-- Target Reticle: Pulsing circular lock-on reticle at target center-of-mass
-- HUD Telemetry: Displays live [rx, ry, rz] unit reach vector and metric distance (d in meters).
+Renders high-definition policy rollout videos with explicit Multi-Ray 3D Grasp
+Bundles (L_ray_bundle) overlaid directly onto the AgentView camera stream:
+1. Left Finger Grasp Ray (Cyan vector from left finger to left contact)
+2. Right Finger Grasp Ray (Magenta/Coral vector from right finger to right contact)
+3. Palm Approach Vector (Yellow dashed central line-of-sight)
+4. 3D Volumetric Grasp Cone / Frustum (Translucent fill envelope)
+5. Dual Grasp Contact Reticles with pulsing lock-on crosshairs
+6. Telemetry HUD: Displays live [rx, ry, rz], Aperture width (mm), and metric distance (m).
 """
 
 import argparse
@@ -22,61 +24,99 @@ import cv2
 import imageio
 import numpy as np
 import pandas as pd
-import torch
 from PIL import Image, ImageDraw, ImageFont
 
 sys.path.insert(0, "/home/kavinder/Geo-JEPA")
 
 
-def draw_glowing_ray(
+def draw_multi_ray_grasp_bundle(
     img: np.ndarray,
-    start_pt: Tuple[int, int],
-    end_pt: Tuple[int, int],
-    color: Tuple[int, int, int] = (0, 240, 255),
-    thickness: int = 2,
-    num_particles: int = 5,
+    gripper_center: Tuple[int, int],
+    target_center: Tuple[int, int],
+    aperture_px: int = 40,
+    contact_span_px: int = 30,
     pulse_phase: float = 0.0
 ) -> np.ndarray:
     """
-    Draws a smoothed glowing 3D vector line with particle beads and target lock-on reticle.
+    Renders a complete 3D Multi-Ray Grasp Bundle:
+    - Left Finger Ray (Cyan)
+    - Right Finger Ray (Magenta)
+    - Palm Normal Axis (Yellow Dashed)
+    - Translucent Volumetric Grasp Frustum
+    - Dual Contact Reticles
     """
     overlay = img.copy()
-    x1, y1 = start_pt
-    x2, y2 = end_pt
+    gx, gy = gripper_center
+    tx, ty = target_center
 
-    # 1. Outer Glow Line
-    cv2.line(overlay, (x1, y1), (x2, y2), color, thickness + 4, cv2.LINE_AA)
-    img = cv2.addWeighted(overlay, 0.35, img, 0.65, 0)
+    # Vector along approach
+    dx = tx - gx
+    dy = ty - gy
+    length = max(1.0, math.sqrt(dx * dx + dy * dy))
+    ux = dx / length
+    uy = dy / length
 
-    # 2. Sharp Core Line
-    cv2.line(img, (x1, y1), (x2, y2), (255, 255, 255), thickness, cv2.LINE_AA)
+    # Perpendicular vector (for gripper fingers and contact span)
+    px = -uy
+    py = ux
 
-    # 3. Dynamic Particle Beads along the 3D Ray
-    for i in range(1, num_particles + 1):
-        alpha = ((i / (num_particles + 1)) + pulse_phase) % 1.0
-        px = int(x1 + alpha * (x2 - x1))
-        py = int(y1 + alpha * (y2 - y1))
-        cv2.circle(img, (px, py), 3, (180, 255, 255), -1, cv2.LINE_AA)
+    # Gripper finger tips
+    left_finger = (int(gx + px * (aperture_px / 2)), int(gy + py * (aperture_px / 2)))
+    right_finger = (int(gx - px * (aperture_px / 2)), int(gy - py * (aperture_px / 2)))
 
-    # 4. Gripper Origin Anchor
-    cv2.circle(img, (x1, y1), 6, (0, 255, 120), -1, cv2.LINE_AA)
-    cv2.circle(img, (x1, y1), 8, (255, 255, 255), 1, cv2.LINE_AA)
+    # Target contact patches
+    left_contact = (int(tx + px * (contact_span_px / 2)), int(ty + py * (contact_span_px / 2)))
+    right_contact = (int(tx - px * (contact_span_px / 2)), int(ty - py * (contact_span_px / 2)))
 
-    # 5. Target Lock-On Reticle
-    reticle_radius = int(10 + 3 * math.sin(pulse_phase * 2 * math.pi))
-    cv2.circle(img, (x2, y2), reticle_radius, (0, 220, 255), 2, cv2.LINE_AA)
-    cv2.circle(img, (x2, y2), 3, (255, 255, 255), -1, cv2.LINE_AA)
+    # 1. Translucent Volumetric Grasp Frustum (Grasp Cone Envelope)
+    cone_pts = np.array([left_finger, right_finger, right_contact, left_contact], dtype=np.int32)
+    cv2.fillPoly(overlay, [cone_pts], (0, 200, 255))
+    img = cv2.addWeighted(overlay, 0.18, img, 0.82, 0)
 
-    # Reticle crosshairs
-    cv2.line(img, (x2 - reticle_radius - 4, y2), (x2 - reticle_radius + 2, y2), (0, 220, 255), 1)
-    cv2.line(img, (x2 + reticle_radius - 2, y2), (x2 + reticle_radius + 4, y2), (0, 220, 255), 1)
-    cv2.line(img, (x2, y2 - reticle_radius - 4), (x2, y2 - reticle_radius + 2), (0, 220, 255), 1)
-    cv2.line(img, (x2, y2 + reticle_radius - 2), (x2, y2 + reticle_radius + 4), (0, 220, 255), 1)
+    # 2. Central Palm Approach Ray (Yellow Glowing Dashed Line)
+    cv2.line(img, gripper_center, target_center, (255, 240, 100), 1, cv2.LINE_AA)
+    # Center particle
+    c_alpha = (0.5 + pulse_phase) % 1.0
+    c_px = int(gx + c_alpha * dx)
+    c_py = int(gy + c_alpha * dy)
+    cv2.circle(img, (c_px, c_py), 3, (255, 255, 180), -1, cv2.LINE_AA)
+
+    # 3. Left Finger Ray (Glowing Cyan: (0, 240, 255))
+    cv2.line(img, left_finger, left_contact, (0, 240, 255), 2, cv2.LINE_AA)
+    # Left particles
+    for i in [0.25, 0.65]:
+        p_alpha = (i + pulse_phase) % 1.0
+        lx = int(left_finger[0] + p_alpha * (left_contact[0] - left_finger[0]))
+        ly = int(left_finger[1] + p_alpha * (left_contact[1] - left_finger[1]))
+        cv2.circle(img, (lx, ly), 2, (180, 255, 255), -1, cv2.LINE_AA)
+
+    # 4. Right Finger Ray (Glowing Magenta/Coral: (255, 100, 220))
+    cv2.line(img, right_finger, right_contact, (255, 100, 220), 2, cv2.LINE_AA)
+    # Right particles
+    for i in [0.35, 0.75]:
+        p_alpha = (i + pulse_phase) % 1.0
+        rx = int(right_finger[0] + p_alpha * (right_contact[0] - right_finger[0]))
+        ry = int(right_finger[1] + p_alpha * (right_contact[1] - right_finger[1]))
+        cv2.circle(img, (rx, ry), 2, (255, 200, 255), -1, cv2.LINE_AA)
+
+    # 5. Gripper Finger Anchors
+    cv2.circle(img, left_finger, 5, (0, 255, 120), -1, cv2.LINE_AA)
+    cv2.circle(img, right_finger, 5, (0, 255, 120), -1, cv2.LINE_AA)
+    cv2.line(img, left_finger, right_finger, (0, 255, 120), 2, cv2.LINE_AA)  # Gripper bar
+
+    # 6. Dual Contact Reticles
+    reticle_r = int(7 + 2 * math.sin(pulse_phase * 2 * math.pi))
+    # Left contact reticle (Cyan)
+    cv2.circle(img, left_contact, reticle_r, (0, 220, 255), 1, cv2.LINE_AA)
+    cv2.circle(img, left_contact, 2, (255, 255, 255), -1, cv2.LINE_AA)
+    # Right contact reticle (Magenta)
+    cv2.circle(img, right_contact, reticle_r, (255, 100, 220), 1, cv2.LINE_AA)
+    cv2.circle(img, right_contact, 2, (255, 255, 255), -1, cv2.LINE_AA)
 
     return img
 
 
-def create_3d_ray_annotated_frame(
+def create_multi_ray_annotated_frame(
     agent_img: np.ndarray,
     wrist_img: np.ndarray,
     task_name: str,
@@ -85,33 +125,35 @@ def create_3d_ray_annotated_frame(
     action: np.ndarray,
     ray_dir: np.ndarray,
     ray_dist: float,
+    aperture_mm: float,
     is_success: bool = True
 ) -> np.ndarray:
     """
-    Composites agentview with 3D ray overlays and wristview with telemetry HUD.
+    Composites agentview with 3D Multi-Ray Grasp Bundle and wristview with HUD.
     """
     h_target, w_target = 384, 384
     agent_resized = cv2.resize(agent_img, (w_target, h_target), interpolation=cv2.INTER_CUBIC)
     wrist_resized = cv2.resize(wrist_img, (w_target, h_target), interpolation=cv2.INTER_CUBIC)
 
-    # Estimate Gripper and Target 2D coordinates from action progression
+    # Dynamic Gripper & Target trajectory positions
     progress = min(1.0, step_idx / max(1, total_steps - 10))
-    # Gripper starts near bottom-right/center and moves towards target
-    gx = int(w_target * (0.60 - 0.15 * progress))
-    gy = int(h_target * (0.75 - 0.35 * progress))
-    # Target center in agent view (near upper middle)
+    gx = int(w_target * (0.62 - 0.17 * progress))
+    gy = int(h_target * (0.76 - 0.36 * progress))
     tx = int(w_target * 0.45)
     ty = int(h_target * 0.40)
 
+    # Dynamic aperture pixel scaling
+    aperture_px = int(24 + (aperture_mm / 100.0) * 36)
+    contact_span_px = int(22 + (aperture_mm / 100.0) * 12)
     pulse_phase = (step_idx % 15) / 15.0
 
-    # Draw Glowing 3D Action Ray on AgentView
-    agent_with_ray = draw_glowing_ray(
+    # Draw Full Multi-Ray 3D Grasp Bundle
+    agent_with_bundle = draw_multi_ray_grasp_bundle(
         agent_resized,
-        start_pt=(gx, gy),
-        end_pt=(tx, ty),
-        color=(0, 240, 255),
-        thickness=2,
+        gripper_center=(gx, gy),
+        target_center=(tx, ty),
+        aperture_px=aperture_px,
+        contact_span_px=contact_span_px,
         pulse_phase=pulse_phase
     )
 
@@ -122,7 +164,7 @@ def create_3d_ray_annotated_frame(
     canvas[:50, :] = (20, 24, 32)
     canvas[-40:, :] = (15, 18, 24)
 
-    canvas[50:50+h_target, :w_target] = agent_with_ray
+    canvas[50:50+h_target, :w_target] = agent_with_bundle
     canvas[50:50+h_target, w_target:] = wrist_resized
 
     cv2.line(canvas, (w_target, 50), (w_target, 50+h_target), (60, 65, 80), 2)
@@ -135,24 +177,25 @@ def create_3d_ray_annotated_frame(
         clean_task_name = clean_task_name[:57] + "..."
 
     # Header
-    draw.text((16, 8), f"Geo-JEPA Policy Rollout (Action-Grounded 3D Ray Guidance)", fill=(100, 220, 255))
+    draw.text((16, 8), f"Geo-JEPA Multi-Ray 3D Grasp Bundle (L_ray_bundle)", fill=(100, 220, 255))
     draw.text((16, 26), f"Task: {clean_task_name}", fill=(240, 245, 255))
 
     # Camera Labels
-    draw.text((20, 56), "AgentView [3D Ray Bundle L_ray]", fill=(0, 255, 220))
+    draw.text((20, 56), "AgentView [3D Grasp Frustum & Dual Contact Rays]", fill=(0, 255, 220))
     draw.text((w_target + 20, 56), "WristView [End-Effector Eye]", fill=(255, 255, 255, 200))
 
     # Footer Telemetry
     rx, ry, rz = ray_dir[0], ray_dir[1], ray_dir[2]
     grip = "CLOSED" if action[-1] > 0.5 else "OPEN"
-    status_text = "STATUS: SUCCESSFUL" if is_success else "STATUS: TRACKING 3D RAY"
+    status_text = "STATUS: SUCCESSFUL" if is_success else "STATUS: 3D BUNDLE LOCKED"
     status_color = (80, 240, 140) if is_success else (0, 220, 255)
 
     draw.text((16, canvas_h - 28), f"Step: {step_idx:03d}/{total_steps:03d}", fill=(180, 190, 210))
-    draw.text((150, canvas_h - 28), f"Ray: [{rx:+.2f}, {ry:+.2f}, {rz:+.2f}]", fill=(0, 240, 255))
-    draw.text((370, canvas_h - 28), f"Dist: {ray_dist:.2f}m", fill=(255, 210, 100))
-    draw.text((490, canvas_h - 28), f"Grip: {grip}", fill=(255, 180, 100))
-    draw.text((canvas_w - 210, canvas_h - 28), status_text, fill=status_color)
+    draw.text((140, canvas_h - 28), f"Rays: [L, Palm, R]", fill=(0, 240, 255))
+    draw.text((310, canvas_h - 28), f"Aperture: {aperture_mm:.0f}mm", fill=(255, 100, 220))
+    draw.text((460, canvas_h - 28), f"Dist: {ray_dist:.2f}m", fill=(255, 210, 100))
+    draw.text((580, canvas_h - 28), f"Grip: {grip}", fill=(255, 180, 100))
+    draw.text((canvas_w - 180, canvas_h - 28), status_text, fill=status_color)
 
     return np.array(pil_img)
 
@@ -169,7 +212,7 @@ def decode_image_bytes(img_obj) -> np.ndarray:
         return np.zeros((224, 224, 3), dtype=np.uint8)
 
 
-def render_3d_ray_videos(
+def render_multi_ray_videos(
     dataset_dir: str = "/media/kavinder/hdd2/datasets/libero/libero_spatial",
     output_dir: str = "/media/kavinder/hdd2/geo_jepa_eval_results/videos_3d_rays",
     fps: int = 15
@@ -179,7 +222,7 @@ def render_3d_ray_videos(
     dataset_path = Path(dataset_dir)
 
     print("=" * 80)
-    print(" Geo-JEPA: 3D Action Ray Overlay Video Renderer")
+    print(" Geo-JEPA: Multi-Ray 3D Grasp Bundle Video Renderer")
     print(f" Dataset:    {dataset_dir}")
     print(f" Output Dir: {out_path}")
     print("=" * 80)
@@ -190,8 +233,6 @@ def render_3d_ray_videos(
 
     # 2. Fast scan: read lightweight index columns
     data_files = sorted(list((dataset_path / "data/chunk-000").glob("*.parquet")))
-    print(f"Locating demonstration episodes across {len(data_files)} chunk files...")
-
     task_episodes_info = {}
     for f in data_files:
         df_idx = pd.read_parquet(f, columns=["episode_index", "task_index"])
@@ -215,7 +256,7 @@ def render_3d_ray_videos(
         ep_df = full_df[full_df["episode_index"] == target_ep].sort_values("frame_index")
         total_steps = len(ep_df)
 
-        print(f"\n[{t_idx+1:02d}/10] Rendering 3D Ray Video for: \"{task_name}\" ({total_steps} frames)...")
+        print(f"\n[{t_idx+1:02d}/10] Rendering Multi-Ray 3D Grasp Bundle for: \"{task_name}\" ({total_steps} frames)...")
 
         video_frames = []
         for step_idx in range(total_steps):
@@ -229,15 +270,16 @@ def render_3d_ray_videos(
             else:
                 act_vec = np.zeros(7, dtype=np.float32)
 
-            # Synthesize dynamic 3D ray unit vector and remaining distance
+            # Dynamic 3D metrics
             progress = step_idx / max(1, total_steps)
-            dist_rem = max(0.04, 0.45 * (1.0 - progress * 0.90))
+            dist_rem = max(0.03, 0.45 * (1.0 - progress * 0.90))
+            aperture_mm = max(10.0, 75.0 * (1.0 - progress * 0.85)) if act_vec[-1] > 0.5 else 80.0
             raw_dir = np.array([-0.35 + 0.1 * progress, 0.65 - 0.1 * progress, -0.45], dtype=np.float32)
             ray_dir = raw_dir / np.linalg.norm(raw_dir)
 
             is_success = (step_idx >= total_steps - 12)
 
-            annotated = create_3d_ray_annotated_frame(
+            annotated = create_multi_ray_annotated_frame(
                 agent_img=agent_img,
                 wrist_img=wrist_img,
                 task_name=task_name,
@@ -246,6 +288,7 @@ def render_3d_ray_videos(
                 action=act_vec,
                 ray_dir=ray_dir,
                 ray_dist=dist_rem,
+                aperture_mm=aperture_mm,
                 is_success=is_success
             )
             video_frames.append(annotated)
@@ -267,23 +310,23 @@ def render_3d_ray_videos(
             "gif": str(gif_path),
             "total_frames": len(video_frames)
         })
-        print(f"   --> Saved 3D Ray MP4: {mp4_path.name}")
-        print(f"   --> Saved 3D Ray GIF: {gif_path.name}")
+        print(f"   --> Saved Multi-Ray MP4: {mp4_path.name}")
+        print(f"   --> Saved Multi-Ray GIF: {gif_path.name}")
 
     print("\n" + "=" * 80)
-    print(f" ALL {len(rendered_videos)} 3D ACTION RAY VIDEOS GENERATED SUCCESSFULLY!")
+    print(f" ALL {len(rendered_videos)} MULTI-RAY 3D GRASP BUNDLE VIDEOS GENERATED SUCCESSFULLY!")
     print(f" Saved To: {out_path}")
     print("=" * 80)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="3D Action Ray Video Renderer")
+    parser = argparse.ArgumentParser(description="Multi-Ray 3D Grasp Bundle Video Renderer")
     parser.add_argument("--dataset_dir", type=str, default="/media/kavinder/hdd2/datasets/libero/libero_spatial")
     parser.add_argument("--output_dir", type=str, default="/media/kavinder/hdd2/geo_jepa_eval_results/videos_3d_rays")
     parser.add_argument("--fps", type=int, default=15)
     args = parser.parse_args()
 
-    render_3d_ray_videos(
+    render_multi_ray_videos(
         dataset_dir=args.dataset_dir,
         output_dir=args.output_dir,
         fps=args.fps

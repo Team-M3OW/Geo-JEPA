@@ -1,42 +1,53 @@
 """
-Unit Tests for ActionRayProjector and MP-Geo Guidance.
+Unit Tests for MultiRayGraspBundleProjector and MP-Geo Guidance.
 """
 
+import sys
 import torch
 import torch.nn as nn
-import sys
+
 sys.path.insert(0, "/home/kavinder/Geo-JEPA")
 
-from geo_jepa.models.action_ray_head import ActionRayProjector
+from geo_jepa.models.action_ray_head import MultiRayGraspBundleProjector
 from geo_jepa.models.mp_geo_guidance import MPGeoGuidance
 
 
-def test_action_ray_projector():
+def test_multi_ray_grasp_bundle():
     B, N_tokens, D = 4, 9, 1024
     action_tokens = torch.randn(B, N_tokens, D, requires_grad=True)
 
-    projector = ActionRayProjector(action_dim=D, hidden_dim=256)
-    ray_dir, ray_dist = projector(action_tokens)
+    projector = MultiRayGraspBundleProjector(action_dim=D, hidden_dim=256, num_cone_rays=4)
+    bundle = projector(action_tokens)
 
     # Assert shapes
-    assert ray_dir.shape == (B, 3)
-    assert ray_dist.shape == (B, 1)
+    assert bundle["ray_left"].shape == (B, 3)
+    assert bundle["ray_palm"].shape == (B, 3)
+    assert bundle["ray_right"].shape == (B, 3)
+    assert bundle["ray_cone"].shape == (B, 4, 3)
+    assert bundle["distances"].shape == (B, 3)
+    assert bundle["aperture"].shape == (B, 1)
 
-    # Assert unit vector norm
-    norms = torch.norm(ray_dir, p=2, dim=-1)
-    assert torch.allclose(norms, torch.ones_like(norms), atol=1e-5)
+    # Assert unit vector normalization
+    for k in ["ray_left", "ray_palm", "ray_right"]:
+        norms = torch.norm(bundle[k], p=2, dim=-1)
+        assert torch.allclose(norms, torch.ones_like(norms), atol=1e-5)
 
-    # Compute loss against target coordinates
-    target_pos_3d = torch.tensor([[0.2, 0.4, 0.1], [0.1, -0.3, 0.2], [-0.2, 0.1, 0.0], [0.3, 0.0, 0.4]])
-    gripper_pos_3d = torch.tensor([[0.0, 0.0, 0.5], [0.0, 0.0, 0.5], [0.0, 0.0, 0.5], [0.0, 0.0, 0.5]])
+    # Compute loss against ground truth contact points
+    gt_left = torch.tensor([[0.18, 0.40, 0.10], [0.08, -0.30, 0.20], [-0.22, 0.10, 0.0], [0.28, 0.0, 0.40]])
+    gt_right = torch.tensor([[0.22, 0.40, 0.10], [0.12, -0.30, 0.20], [-0.18, 0.10, 0.0], [0.32, 0.0, 0.40]])
+    gt_center = torch.tensor([[0.20, 0.40, 0.10], [0.10, -0.30, 0.20], [-0.20, 0.10, 0.0], [0.30, 0.0, 0.40]])
+    gt_gripper = torch.tensor([[0.0, 0.0, 0.50], [0.0, 0.0, 0.50], [0.0, 0.0, 0.50], [0.0, 0.0, 0.50]])
+    gt_aperture = torch.tensor([[0.04], [0.05], [0.04], [0.06]])
 
-    loss_dict = projector.compute_ray_loss(ray_dir, ray_dist, target_pos_3d, gripper_pos_3d)
-    loss = loss_dict["loss_ray_total"]
+    loss_dict = projector.compute_bundle_loss(
+        bundle, gt_left, gt_right, gt_center, gt_gripper, gt_aperture
+    )
+    loss = loss_dict["loss_bundle_total"]
 
     loss.backward()
     assert action_tokens.grad is not None
     assert not torch.isnan(loss)
-    print(f"ActionRayProjector Unit Test PASSED! Total Ray Loss: {loss.item():.4f}")
+    print(f"MultiRayGraspBundleProjector Unit Test PASSED! Bundle Loss: {loss.item():.4f}, Mean Cos Sim: {loss_dict['mean_cos_sim'].item():.4f}")
 
 
 def test_mp_geo_guidance():
@@ -55,5 +66,5 @@ def test_mp_geo_guidance():
 
 
 if __name__ == "__main__":
-    test_action_ray_projector()
+    test_multi_ray_grasp_bundle()
     test_mp_geo_guidance()
