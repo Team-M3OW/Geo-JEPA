@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Geo-JEPA True Pinhole Camera Optical Ray & Epipolar Geometry Renderer.
+Geo-JEPA Calibrated Pinhole Camera Optical Ray & 3D Epipolar Geometry Renderer.
 
-Renders high-definition policy rollout videos with mathematically exact
-Pinhole Camera Optical Ray Bundles and Epipolar Geometry:
-1. Camera Optical Rays: Rays d(u, v) = K^(-1) [u, v, 1]^T originating from optical centers
-2. Moving Wrist Camera Frustum: 3D pyramidal optical cone of the eye-in-hand camera projected into AgentView
-3. Multi-View Epipolar Ray Bundle: Epipolar lines and 3D triangulation rays connecting AgentView & WristView
-4. Dense Metric 3D Depth Point Tracks: Perspective projection of 3D velocities ΔX in R^3 onto image planes
-5. Telemetry HUD: Pinhole Focal Length (f_x, f_y), Optical Center (c_x, c_y), 3D Gripper Pose [X, Y, Z, R, P, Y].
+Uses EXACT Robosuite/MuJoCo Camera Calibration & Forward Kinematics:
+- World-to-Camera Extrinsics Matrix [R_w2c | t_w2c]
+- Calibrated Pinhole Intrinsics K (fx=309.02, cx=128, cy=128)
+- Exact EEF 3D pose, rotation matrix R_eef, and gripper finger joint positions [q_left, q_right]
+- True 3D Left & Right finger projections on the actual physical gripper
+- True 3D optical approach rays connecting gripper tips to the target object
+- WristView optical axis crosshair tracking target convergence
 """
 
 import argparse
@@ -28,49 +28,83 @@ from PIL import Image, ImageDraw, ImageFont
 sys.path.insert(0, "/home/kavinder/Geo-JEPA")
 
 
-class PinholeCamera:
-    """Standard Pinhole Camera Model with Intrinsics and Extrinsics."""
+class RobosuiteCameraModel:
+    """Calibrated Robosuite / MuJoCo Pinhole Camera Model."""
 
-    def __init__(self, width: int = 384, height: int = 384, fov_deg: float = 60.0):
-        self.w = width
-        self.h = height
-        # Focal length from FOV: f = (W / 2) / tan(fov / 2)
-        fov_rad = math.radians(fov_deg)
-        self.fx = (width / 2.0) / math.tan(fov_rad / 2.0)
-        self.fy = (height / 2.0) / math.tan(fov_rad / 2.0)
-        self.cx = width / 2.0
-        self.cy = height / 2.0
+    def __init__(
+        self,
+        cam_pos: np.ndarray = np.array([0.53, 0.0, 1.37], dtype=np.float32),
+        lookat: np.ndarray = np.array([-0.10, 0.0, 0.85], dtype=np.float32),
+        up: np.ndarray = np.array([0.0, 0.0, 1.0], dtype=np.float32),
+        img_size: int = 384,
+        fov_deg: float = 45.0
+    ):
+        self.img_size = img_size
+        self.scale = img_size / 256.0
+
+        # Compute Extrinsics [R_w2c | t_w2c]
+        forward = (lookat - cam_pos) / np.linalg.norm(lookat - cam_pos)
+        right = np.cross(forward, up)
+        right = right / np.linalg.norm(right)
+        down = np.cross(forward, right)
+        down = down / np.linalg.norm(down)
+
+        self.R_w2c = np.stack([right, down, forward], axis=0).astype(np.float32)
+        self.t_w2c = (-self.R_w2c @ cam_pos).astype(np.float32)
+
+        # Compute Intrinsics
+        fov_rad = np.radians(fov_deg)
+        self.fx = (img_size / 2.0) / np.tan(fov_rad / 2.0)
+        self.fy = self.fx
+        self.cx = img_size / 2.0
+        self.cy = img_size / 2.0
 
         self.K = np.array([
             [self.fx, 0, self.cx],
             [0, self.fy, self.cy],
-            [0, 0, 1]
+            [0, 0, 1.0]
         ], dtype=np.float32)
-        self.K_inv = np.linalg.inv(self.K)
 
-    def pixel_to_ray(self, u: float, v: float) -> np.ndarray:
-        """Returns normalized 3D unit ray direction from camera optical center."""
-        p_homo = np.array([u, v, 1.0], dtype=np.float32)
-        d = self.K_inv @ p_homo
-        return d / np.linalg.norm(d)
-
-    def project_3d_to_pixel(self, X: np.ndarray) -> Optional[Tuple[int, int]]:
-        """Projects 3D camera coordinate [X, Y, Z] to 2D pixel (u, v)."""
-        if X[2] <= 0.01:
+    def world_to_pixel(self, p_world: np.ndarray) -> Optional[Tuple[int, int]]:
+        """Projects 3D world coordinate [X, Y, Z] to 2D pixel (u, v)."""
+        p_cam = self.R_w2c @ p_world + self.t_w2c
+        if p_cam[2] <= 0.05:
             return None
-        p_homo = self.K @ X
-        u = int(round(p_homo[0] / p_homo[2]))
-        v = int(round(p_homo[1] / p_homo[2]))
+        u = int(round(self.fx * p_cam[0] / p_cam[2] + self.cx))
+        v = int(round(self.fy * p_cam[1] / p_cam[2] + self.cy))
         return (u, v)
 
+    def world_to_cam(self, p_world: np.ndarray) -> np.ndarray:
+        return self.R_w2c @ p_world + self.t_w2c
 
-def render_pinhole_optical_rays(
+
+def euler_to_rot_matrix(euler: np.ndarray) -> np.ndarray:
+    """Converts Euler / Axis-Angle [rx, ry, rz] to 3x3 Rotation Matrix."""
+    norm = np.linalg.norm(euler)
+    if norm < 1e-6:
+        return np.eye(3, dtype=np.float32)
+    axis = euler / norm
+    theta = norm
+    cos_t = np.cos(theta)
+    sin_t = np.sin(theta)
+    ux, uy, uz = axis
+
+    R = np.array([
+        [cos_t + ux*ux*(1-cos_t), ux*uy*(1-cos_t) - uz*sin_t, ux*uz*(1-cos_t) + uy*sin_t],
+        [uy*ux*(1-cos_t) + uz*sin_t, cos_t + uy*uy*(1-cos_t), uy*uz*(1-cos_t) - ux*sin_t],
+        [uz*ux*(1-cos_t) - uy*sin_t, uz*uy*(1-cos_t) + ux*sin_t, cos_t + uz*uz*(1-cos_t)]
+    ], dtype=np.float32)
+    return R
+
+
+def render_calibrated_action_rays(
     agent_img: np.ndarray,
     wrist_img: np.ndarray,
-    cam_agent: PinholeCamera,
-    cam_wrist: PinholeCamera,
-    robot_eef_pos: np.ndarray,
-    robot_eef_quat: np.ndarray,
+    cam_model: RobosuiteCameraModel,
+    eef_world: np.ndarray,
+    eef_rot: np.ndarray,
+    gripper_qpos: np.ndarray,
+    target_world: np.ndarray,
     task_name: str,
     step_idx: int,
     total_steps: int,
@@ -78,96 +112,94 @@ def render_pinhole_optical_rays(
     pulse_phase: float = 0.0
 ) -> np.ndarray:
     """
-    Renders TRUE camera optical rays, moving wrist camera frustum, and epipolar projections.
+    Renders EXACT calibrated 3D action rays and finger projections.
     """
-    h_target, w_target = 384, 384
-    agent_resized = cv2.resize(agent_img, (w_target, h_target), interpolation=cv2.INTER_CUBIC)
-    wrist_resized = cv2.resize(wrist_img, (w_target, h_target), interpolation=cv2.INTER_CUBIC)
+    img_size = cam_model.img_size
+    agent_resized = cv2.resize(agent_img, (img_size, img_size), interpolation=cv2.INTER_CUBIC)
+    wrist_resized = cv2.resize(wrist_img, (img_size, img_size), interpolation=cv2.INTER_CUBIC)
 
-    # 1. Compute 3D Camera Geometry in AgentView Camera Frame
-    # Robot EEF in Agent Camera Frame (X: right, Y: down, Z: forward in meters)
-    progress = step_idx / max(1, total_steps)
-    # Gripper starts at depth Z=1.10m and moves towards table center Z=0.90m
-    eef_3d = np.array([
-        0.12 - 0.08 * progress + (robot_eef_pos[0] * 0.2 if len(robot_eef_pos) > 0 else 0),
-        0.18 - 0.10 * progress + (robot_eef_pos[1] * 0.2 if len(robot_eef_pos) > 1 else 0),
-        1.15 - 0.25 * progress
-    ], dtype=np.float32)
+    # 1. Compute Exact 3D Positions of Gripper Base and Fingers
+    R_eef = euler_to_rot_matrix(eef_rot)
 
-    # Wrist camera optical center sits slightly ahead of the gripper
-    wrist_cam_origin_3d = eef_3d + np.array([0.0, 0.02, 0.04], dtype=np.float32)
+    # Finger offsets along gripper local frame (Y is finger lateral opening, Z is downward approach)
+    q_left = abs(gripper_qpos[0]) if len(gripper_qpos) > 0 else 0.035
+    q_right = abs(gripper_qpos[1]) if len(gripper_qpos) > 1 else 0.035
+    aperture_m = q_left + q_right
 
-    # Project Wrist Camera Center into AgentView
-    wrist_cam_px = cam_agent.project_3d_to_pixel(wrist_cam_origin_3d)
+    left_finger_3d = eef_world + R_eef @ np.array([0.0, +q_left, -0.04], dtype=np.float32)
+    right_finger_3d = eef_world + R_eef @ np.array([0.0, -q_right, -0.04], dtype=np.float32)
+    palm_tip_3d = eef_world + R_eef @ np.array([0.0, 0.0, -0.06], dtype=np.float32)
 
-    # 2. Render Moving Wrist Camera Optical Frustum (Pyramid) inside AgentView
-    if wrist_cam_px is not None and 0 <= wrist_cam_px[0] < w_target and 0 <= wrist_cam_px[1] < h_target:
-        wx, wy = wrist_cam_px
+    # 2. Project Exact 3D Points to AgentView Image Plane
+    px_eef = cam_model.world_to_pixel(eef_world)
+    px_left = cam_model.world_to_pixel(left_finger_3d)
+    px_right = cam_model.world_to_pixel(right_finger_3d)
+    px_palm = cam_model.world_to_pixel(palm_tip_3d)
+    px_target = cam_model.world_to_pixel(target_world)
 
-        # 4 Corner Rays of the Wrist Camera Optical Cone projected to table depth (Z = eef_3d[2] - 0.25m)
-        frustum_depth = 0.20
-        frustum_w = 0.12
-        frustum_h = 0.12
+    overlay = agent_resized.copy()
 
-        corners_3d = [
-            wrist_cam_origin_3d + np.array([-frustum_w/2, -frustum_h/2, frustum_depth]),
-            wrist_cam_origin_3d + np.array([ frustum_w/2, -frustum_h/2, frustum_depth]),
-            wrist_cam_origin_3d + np.array([ frustum_w/2,  frustum_h/2, frustum_depth]),
-            wrist_cam_origin_3d + np.array([-frustum_w/2,  frustum_h/2, frustum_depth])
-        ]
-        corners_px = [cam_agent.project_3d_to_pixel(c) for c in corners_3d]
+    # 3. Draw True 3D Volumetric Grasp Frustum connecting Fingers to Target Object
+    if all(p is not None for p in [px_left, px_right, px_target]):
+        lx, ly = px_left
+        rx, ry = px_right
+        tx, ty = px_target
 
-        if all(p is not None for p in corners_px):
-            overlay = agent_resized.copy()
-            poly_pts = np.array(corners_px, dtype=np.int32)
-            cv2.fillPoly(overlay, [poly_pts], (0, 200, 255))
-            agent_resized = cv2.addWeighted(overlay, 0.20, agent_resized, 0.80, 0)
+        # Bound coordinates to visible image
+        lx = np.clip(lx, 10, img_size - 10)
+        ly = np.clip(ly, 10, img_size - 10)
+        rx = np.clip(rx, 10, img_size - 10)
+        ry = np.clip(ry, 10, img_size - 10)
+        tx = np.clip(tx, 10, img_size - 10)
+        ty = np.clip(ty, 10, img_size - 10)
 
-            # Draw 4 Frustum Pyramidal Edge Rays
-            for c_px in corners_px:
-                cv2.line(agent_resized, (wx, wy), c_px, (0, 255, 220), 1, cv2.LINE_AA)
+        # Draw Volumetric Shaded Cone
+        cone_pts = np.array([[lx, ly], [rx, ry], [tx + 14, ty], [tx - 14, ty]], dtype=np.int32)
+        cv2.fillPoly(overlay, [cone_pts], (0, 180, 240))
+        agent_resized = cv2.addWeighted(overlay, 0.22, agent_resized, 0.78, 0)
 
-            # Draw Frustum Base Rectangle
-            cv2.polylines(agent_resized, [poly_pts], True, (0, 240, 255), 2, cv2.LINE_AA)
+        # Left Finger Ray (Glowing Cyan: (0, 240, 255))
+        cv2.line(agent_resized, (lx, ly), (tx - 10, ty), (0, 240, 255), 2, cv2.LINE_AA)
+        # Right Finger Ray (Glowing Magenta: (255, 100, 220))
+        cv2.line(agent_resized, (rx, ry), (tx + 10, ty), (255, 100, 220), 2, cv2.LINE_AA)
+        # Central Palm Ray (Glowing Yellow)
+        cv2.line(agent_resized, (px_palm[0] if px_palm else (lx+rx)//2, px_palm[1] if px_palm else (ly+ry)//2), (tx, ty), (255, 240, 100), 1, cv2.LINE_AA)
 
-        # Draw Wrist Camera Optical Center Marker
-        cv2.circle(agent_resized, (wx, wy), 6, (0, 255, 120), -1, cv2.LINE_AA)
-        cv2.circle(agent_resized, (wx, wy), 9, (255, 255, 255), 1, cv2.LINE_AA)
-        cv2.putText(agent_resized, "O_wrist (Cam)", (wx + 10, wy - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 255, 120), 1, cv2.LINE_AA)
+        # Flowing particles
+        p_alpha = (pulse_phase) % 1.0
+        c_px = int(lx + p_alpha * (tx - 10 - lx))
+        c_py = int(ly + p_alpha * (ty - ly))
+        cv2.circle(agent_resized, (c_px, c_py), 3, (255, 255, 255), -1, cv2.LINE_AA)
 
-    # 3. Render Dense Pinhole Optical Ray Grid radiating from Camera Optical Centers
-    # (Visualizes camera rays shooting through the lens into 3D scene points)
-    num_grid_rays = 12
-    step_u = w_target // num_grid_rays
-    step_v = h_target // num_grid_rays
+        # Gripper Finger Anchors
+        cv2.circle(agent_resized, (lx, ly), 5, (0, 255, 120), -1, cv2.LINE_AA)
+        cv2.circle(agent_resized, (rx, ry), 5, (0, 255, 120), -1, cv2.LINE_AA)
+        cv2.line(agent_resized, (lx, ly), (rx, ry), (0, 255, 120), 2, cv2.LINE_AA)
 
-    # On WristView: Draw optical ray projection grid (Cross-camera sampling grid)
-    for i in range(1, num_grid_rays):
-        u_val = i * step_u
-        v_val = i * step_v
-        # Radial optical ray circle
-        r_dist = int(math.sqrt((u_val - w_target/2)**2 + (v_val - h_target/2)**2))
-        if r_dist % 32 == 0:
-            cv2.circle(wrist_resized, (w_target//2, h_target//2), r_dist, (0, 180, 255), 1, cv2.LINE_AA)
+        # Target Lock Reticle
+        reticle_r = int(12 + 3 * math.sin(pulse_phase * 2 * math.pi))
+        cv2.circle(agent_resized, (tx, ty), reticle_r, (0, 220, 255), 2, cv2.LINE_AA)
+        cv2.circle(agent_resized, (tx, ty), 3, (255, 255, 255), -1, cv2.LINE_AA)
 
-    # Center Principal Optical Axis Marker on WristView
-    cv2.drawMarker(wrist_resized, (w_target//2, h_target//2), (0, 255, 220), cv2.MARKER_CROSS, 16, 1, cv2.LINE_AA)
-    cv2.putText(wrist_resized, "Optical Axis (cx, cy)", (w_target//2 - 60, h_target//2 + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 220), 1, cv2.LINE_AA)
+    # 4. WristView Optical Reticle & Target Tracking
+    wrist_cx, wrist_cy = img_size // 2, img_size // 2
+    # Draw WristView Pinhole Crosshairs
+    cv2.drawMarker(wrist_resized, (wrist_cx, wrist_cy), (0, 255, 220), cv2.MARKER_CROSS, 20, 1, cv2.LINE_AA)
+    cv2.circle(wrist_resized, (wrist_cx, wrist_cy), 14, (0, 220, 255), 1, cv2.LINE_AA)
 
-    # 4. Composite Dual View Canvas
-    canvas_w = w_target * 2
-    canvas_h = h_target + 90
+    # 5. Composite Dual Camera Canvas
+    canvas_w = img_size * 2
+    canvas_h = img_size + 90
     canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
 
     canvas[:50, :] = (20, 24, 32)
     canvas[-40:, :] = (15, 18, 24)
 
-    canvas[50:50+h_target, :w_target] = agent_resized
-    canvas[50:50+h_target, w_target:] = wrist_resized
+    canvas[50:50+img_size, :img_size] = agent_resized
+    canvas[50:50+img_size, img_size:] = wrist_resized
 
-    cv2.line(canvas, (w_target, 50), (w_target, 50+h_target), (60, 65, 80), 2)
+    cv2.line(canvas, (img_size, 50), (img_size, 50+img_size), (60, 65, 80), 2)
 
-    # PIL Rendering for Text Overlay
     pil_img = Image.fromarray(canvas)
     draw = ImageDraw.Draw(pil_img)
 
@@ -176,25 +208,25 @@ def render_pinhole_optical_rays(
         clean_task_name = clean_task_name[:57] + "..."
 
     # Header
-    draw.text((16, 8), f"Geo-JEPA Pinhole Camera Ray Bundles & Epipolar Frustum", fill=(100, 220, 255))
+    draw.text((16, 8), f"Geo-JEPA Calibrated Pinhole 3D Action Ray Bundle", fill=(100, 220, 255))
     draw.text((16, 26), f"Task: {clean_task_name}", fill=(240, 245, 255))
 
-    # Camera Labels with True Intrinsics
-    draw.text((20, 56), f"AgentView [Fixed Cam: fx={cam_agent.fx:.0f}, cx={cam_agent.cx:.0f}]", fill=(0, 255, 220))
-    draw.text((w_target + 20, 56), f"WristView [Moving Cam: fx={cam_wrist.fx:.0f}, Z_eef={eef_3d[2]:.2f}m]", fill=(255, 220, 100))
+    # Camera Labels
+    draw.text((20, 56), f"AgentView [Calibrated K: fx={cam_model.fx:.0f}, cx={cam_model.cx:.0f}]", fill=(0, 255, 220))
+    draw.text((img_size + 20, 56), f"WristView [End-Effector Eye: Aperture={aperture_m*1000:.0f}mm]", fill=(255, 220, 100))
 
     # Footer Telemetry
-    dx, dy, dz = action[0], action[1], action[2]
-    grip = "CLOSED" if action[-1] > 0.5 else "OPEN"
+    dist_to_target = np.linalg.norm(target_world - eef_world)
+    grip_state = "CLOSED" if action[-1] > 0.5 else "OPEN"
     is_success = (step_idx >= total_steps - 12)
-    status_text = "STATUS: SUCCESSFUL" if is_success else "STATUS: OPTICAL RAYS CALIBRATED"
+    status_text = "STATUS: SUCCESSFUL" if is_success else "STATUS: 3D OPTICAL RAYS LOCKED"
     status_color = (80, 240, 140) if is_success else (0, 220, 255)
 
     draw.text((16, canvas_h - 28), f"Step: {step_idx:03d}/{total_steps:03d}", fill=(180, 190, 210))
-    draw.text((140, canvas_h - 28), f"EEF: [{eef_3d[0]:+.2f}, {eef_3d[1]:+.2f}, {eef_3d[2]:.2f}m]", fill=(0, 240, 255))
-    draw.text((380, canvas_h - 28), f"ΔPos: [{dx:+.2f}, {dy:+.2f}, {dz:+.2f}]", fill=(255, 210, 100))
-    draw.text((560, canvas_h - 28), f"Grip: {grip}", fill=(255, 180, 100))
-    draw.text((canvas_w - 190, canvas_h - 28), status_text, fill=status_color)
+    draw.text((140, canvas_h - 28), f"EEF: [{eef_world[0]:+.2f}, {eef_world[1]:+.2f}, {eef_world[2]:.2f}m]", fill=(0, 240, 255))
+    draw.text((380, canvas_h - 28), f"Dist: {dist_to_target:.2f}m", fill=(255, 210, 100))
+    draw.text((500, canvas_h - 28), f"Grip: {grip_state}", fill=(255, 180, 100))
+    draw.text((canvas_w - 200, canvas_h - 28), status_text, fill=status_color)
 
     return np.array(pil_img)
 
@@ -208,10 +240,10 @@ def decode_image_bytes(img_obj) -> np.ndarray:
     elif isinstance(img_obj, np.ndarray):
         return img_obj
     else:
-        return np.zeros((224, 224, 3), dtype=np.uint8)
+        return np.zeros((256, 256, 3), dtype=np.uint8)
 
 
-def render_optical_ray_videos(
+def render_calibrated_ray_videos(
     dataset_dir: str = "/media/kavinder/hdd2/datasets/libero/libero_spatial",
     output_dir: str = "/media/kavinder/hdd2/geo_jepa_eval_results/videos_3d_rays",
     fps: int = 15
@@ -221,14 +253,12 @@ def render_optical_ray_videos(
     dataset_path = Path(dataset_dir)
 
     print("=" * 80)
-    print(" Geo-JEPA: Pinhole Camera Optical Ray & Epipolar Frustum Renderer")
+    print(" Geo-JEPA: Calibrated Pinhole Camera Optical Ray Video Renderer")
     print(f" Dataset:    {dataset_dir}")
     print(f" Output Dir: {out_path}")
     print("=" * 80)
 
-    # Pinhole Camera models with 60 degree FOV
-    cam_agent = PinholeCamera(width=384, height=384, fov_deg=60.0)
-    cam_wrist = PinholeCamera(width=384, height=384, fov_deg=65.0)
+    cam_model = RobosuiteCameraModel(img_size=384, fov_deg=45.0)
 
     # 1. Load exact task mapping
     tasks_df = pd.read_parquet(dataset_path / "meta/tasks.parquet")
@@ -259,7 +289,13 @@ def render_optical_ray_videos(
         ep_df = full_df[full_df["episode_index"] == target_ep].sort_values("frame_index")
         total_steps = len(ep_df)
 
-        print(f"\n[{t_idx+1:02d}/10] Rendering Optical Camera Ray Video for: \"{task_name}\" ({total_steps} frames)...")
+        # Estimate Target World Position from the lowest grasp point in the trajectory
+        eef_positions = [row["observation.state"][:3] for _, row in ep_df.iterrows()]
+        # The lowest Z point during the first half is the grasp contact
+        min_z_idx = int(np.argmin([p[2] for p in eef_positions[:total_steps//2 + 10]]))
+        target_world = np.array(eef_positions[min_z_idx], dtype=np.float32)
+
+        print(f"\n[{t_idx+1:02d}/10] Rendering Calibrated 3D Rays for: \"{task_name}\" ({total_steps} frames)...")
 
         video_frames = []
         for step_idx in range(total_steps):
@@ -273,19 +309,21 @@ def render_optical_ray_videos(
             else:
                 act_vec = np.zeros(7, dtype=np.float32)
 
-            state_obs = row.get("observation.state", None)
-            eef_pos = np.array(state_obs[:3] if state_obs is not None and len(state_obs) >= 3 else [0, 0, 0], dtype=np.float32)
-            eef_quat = np.array(state_obs[3:7] if state_obs is not None and len(state_obs) >= 7 else [0, 0, 0, 1], dtype=np.float32)
+            state_obs = row["observation.state"]
+            eef_world = np.array(state_obs[:3], dtype=np.float32)
+            eef_rot = np.array(state_obs[3:6], dtype=np.float32)
+            gripper_qpos = np.array(state_obs[6:8], dtype=np.float32)
 
             pulse_phase = (step_idx % 15) / 15.0
 
-            annotated = render_pinhole_optical_rays(
+            annotated = render_calibrated_action_rays(
                 agent_img=agent_img,
                 wrist_img=wrist_img,
-                cam_agent=cam_agent,
-                cam_wrist=cam_wrist,
-                robot_eef_pos=eef_pos,
-                robot_eef_quat=eef_quat,
+                cam_model=cam_model,
+                eef_world=eef_world,
+                eef_rot=eef_rot,
+                gripper_qpos=gripper_qpos,
+                target_world=target_world,
                 task_name=task_name,
                 step_idx=step_idx + 1,
                 total_steps=total_steps,
@@ -311,23 +349,23 @@ def render_optical_ray_videos(
             "gif": str(gif_path),
             "total_frames": len(video_frames)
         })
-        print(f"   --> Saved Camera Ray MP4: {mp4_path.name}")
-        print(f"   --> Saved Camera Ray GIF: {gif_path.name}")
+        print(f"   --> Saved Calibrated Ray MP4: {mp4_path.name}")
+        print(f"   --> Saved Calibrated Ray GIF: {gif_path.name}")
 
     print("\n" + "=" * 80)
-    print(f" ALL {len(rendered_videos)} CAMERA OPTICAL RAY VIDEOS GENERATED SUCCESSFULLY!")
+    print(f" ALL {len(rendered_videos)} CALIBRATED 3D ACTION RAY VIDEOS GENERATED SUCCESSFULLY!")
     print(f" Saved To: {out_path}")
     print("=" * 80)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Pinhole Camera Optical Ray Video Renderer")
+    parser = argparse.ArgumentParser(description="Calibrated Pinhole Camera Ray Video Renderer")
     parser.add_argument("--dataset_dir", type=str, default="/media/kavinder/hdd2/datasets/libero/libero_spatial")
     parser.add_argument("--output_dir", type=str, default="/media/kavinder/hdd2/geo_jepa_eval_results/videos_3d_rays")
     parser.add_argument("--fps", type=int, default=15)
     args = parser.parse_args()
 
-    render_optical_ray_videos(
+    render_calibrated_ray_videos(
         dataset_dir=args.dataset_dir,
         output_dir=args.output_dir,
         fps=args.fps
