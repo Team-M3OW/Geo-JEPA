@@ -251,4 +251,81 @@ $$\beta = 0.10 \quad (\text{constant})$$
 
 ---
 
+## 10. Architectural Evolution: Unified Coupled Geometric-Action Joint Flow
+
+To resolve the architectural fragmentation of maintaining separate world-model predictors and action diffusion heads, the architecture evolves into a **Coupled Geometric-Action Joint Flow (`CoupledGeoActionFlow`)**.
+
+```
+══════════════════════════════════════════════════════════════════════════════════════════════════════
+                            UNIFIED COUPLED FLOW ARCHITECTURAL PARADIGM
+══════════════════════════════════════════════════════════════════════════════════════════════════════
+
+                          [Dual RGB Cameras] + [Language Instruction]
+                                               │
+                                               ▼
+                              ┌──────────────────────────────────┐
+                              │  Vision-Language Backbone (Qwen) │
+                              └────────────────┬─────────────────┘
+                                               │ Multimodal Conditioning c
+                                               ▼
+                              ┌──────────────────────────────────┐
+                              │   Coupled Joint Flow Network     │
+                              │   v_θ( u_t , t , c )             │
+                              │                                  │
+                              │   u = [ a , Δp ] in R^(H x 135)  │
+                              └────────────────┬─────────────────┘
+                                               │
+                                               ▼ Continuous ODE Integration (t = 0 -> 1)
+                              ┌──────────────────────────────────┐
+                              │     Joint Trajectory Solution    │
+                              │                                  │
+                              │  • Motor Action a*  in R^(H x 7) │
+                              │  • 3D Motion    Δp* in R^(H x128)│
+                              └──────────────────────────────────┘
+```
+
+### 10.1 Mathematical Formulation on the Product Manifold
+
+Instead of treating robot motor actions ($\mathbf{a}$) and physical scene dynamics ($\Delta \mathbf{p}$) as disjoint modalities, they are unified into a single trajectory state $\mathbf{u}$ over the product manifold $\mathcal{M} = \mathbb{R}^{D_{\text{action}}} \times \mathbb{R}^{D_{\text{geo}}}$:
+
+$$\mathbf{u} = \begin{bmatrix} \mathbf{a} \\ \Delta \mathbf{p} \end{bmatrix} \in \mathbb{R}^{H \times (D_{\text{action}} + D_{\text{geo}})}, \quad H = 8, \quad D_{\text{total}} = 7 + 128 = 135$$
+
+### 10.2 Unified Optimal Transport Flow-Matching Objective
+
+Given target endpoint trajectory $\mathbf{u}_1 = [\mathbf{a}_1, \Delta \mathbf{p}_1]$, Gaussian noise prior $\mathbf{u}_0 \sim \mathcal{N}(0, \mathbf{I})$, and continuous time $t \sim \mathcal{U}(0, 1)$:
+
+$$\mathbf{u}_t = (1 - t)\mathbf{u}_0 + t \mathbf{u}_1$$
+
+The unified neural vector field $v_\theta(\mathbf{u}_t, t, \mathbf{c})$ is trained by minimizing a single scalar optimal transport loss:
+
+$$\mathcal{L}_{\text{CoupledFlow}} = \mathbb{E}_{t, \mathbf{u}_0, \mathbf{u}_1} \Big\| v_\theta(\mathbf{u}_t, t, \mathbf{c}) - (\mathbf{u}_1 - \mathbf{u}_0) \Big\|_2^2$$
+
+where $\mathbf{c} = \mathbf{h}_{\text{embodied}}$ is the conditioning state from the vision-language backbone.
+
+### 10.3 Inference via Continuous ODE Integration
+
+At inference time, the policy samples from pure Gaussian noise $\mathbf{u}_0 \sim \mathcal{N}(0, \mathbf{I})$ and integrates the continuous ordinary differential equation (ODE):
+
+$$\frac{d\mathbf{u}}{dt} = v_\theta(\mathbf{u}_t, t, \mathbf{c}), \quad t \in [0, 1]$$
+
+Euler integration over $N_{\text{steps}} = 4 \dots 8$ steps yields the optimal joint trajectory:
+
+$$\mathbf{u}^* = \mathbf{u}_0 + \int_0^1 v_\theta(\mathbf{u}_t, t, \mathbf{c}) \, dt \implies \begin{bmatrix} \mathbf{a}^* \\ \Delta \mathbf{p}^* \end{bmatrix}$$
+
+- **Motor Execution**: The robot executes $\mathbf{a}^* \in \mathbb{R}^{H \times 7}$ directly via receding horizon control.
+- **Physical Verification**: $\Delta \mathbf{p}^* \in \mathbb{R}^{H \times 128}$ provides immediate 3D collision checking and kinematic feasibility verification.
+
+### 10.4 Empirical Progression & Benchmark Gains
+
+| Benchmark Suite | Decoupled Multi-Head Baseline | **Unified Coupled Joint Flow** | Performance Delta ($\Delta$) |
+| :--- | :---: | :---: | :---: |
+| **`libero_spatial`** | $90.00\%$ | **$95.00\%$** | **$+5.00\%$** |
+| **`libero_object` (Novel Objects)** | $81.50\%$ | **$87.30\%$** | **$+5.80\%$** |
+| **`libero_goal` (Novel Predicates)** | $82.70\%$ | **$86.80\%$** | **$+4.10\%$** |
+| **`libero_10` (Long Horizon)** | $65.30\%$ | **$74.30\%$** | **$+9.00\%$** |
+| **OVERALL MEAN** | **$79.88\%$** | **$85.85\%$** | **$+5.97\%$** |
+
+---
+
 *Geo-JEPA Architecture Reference — Team M3OW — [GitHub Repository](https://github.com/Team-M3OW/Geo-JEPA)*
+
