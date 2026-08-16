@@ -54,8 +54,8 @@ $$\mathcal{L}_{\text{Geo-JEPA}} = \mathcal{L}_{\text{FM}}(\mathbf{a}, \hat{\math
 | Loss Term | Name | Mathematical Formulation | Supervision Target |
 | :--- | :--- | :--- | :--- |
 | **$\mathcal{L}_{\text{FM}}$** | Flow-Matching Action Head | $\mathbb{E}_{t, x_1, \epsilon} \big[ \| v_\theta(x_t, t, \mathbf{c}) - (x_1 - \epsilon) \|_2^2 \big]$ | Ground-truth 7-DoF robot action chunks $[H=8, 7]$ |
-| **$\mathcal{L}_{\text{WM}}^{\text{sem}}$** | Semantic World Model | $\| \hat{\mathbf{s}}_{t+1:t+T}^{\text{sem}} - \text{stop\_grad}(\mathbf{s}_{t+1:t+T}^{\text{V-JEPA2}}) \|_1$ | Frozen V-JEPA2 ViT-L video latents ($\beta = 0.1$) |
-| **$\mathcal{L}_{\text{WM}}^{\text{geo}}$** | Geometric Dynamics Model | $\text{SmoothL1}\Big(\Delta \hat{\mathbf{p}}_{t:t+T}, \text{stop\_grad}(\Delta \mathbf{p}_{t:t+T}^{\text{canon}})\Big)$ | Canonicalized 3D point-track displacements ($\gamma(t) = 0.1$) |
+| **$\mathcal{L}_{\text{WM}}^{\text{sem}}$** | Semantic World Model | $\| \hat{\mathbf{s}}_{t+1:t+T}^{\text{sem}} - \operatorname{stop-gradient}(\mathbf{s}_{t+1:t+T}^{\text{V-JEPA2}}) \|_1$ | Frozen V-JEPA2 ViT-L video latents ($\beta = 0.1$) |
+| **$\mathcal{L}_{\text{WM}}^{\text{geo}}$** | Geometric Dynamics Model | $\operatorname{SmoothL1}\Big(\Delta \hat{\mathbf{p}}_{t:t+T}, \operatorname{stop-gradient}(\Delta \mathbf{p}_{t:t+T}^{\text{canon}})\Big)$ | Canonicalized 3D point-track displacements ($\gamma(t) = 0.1$) |
 | **$\mathcal{L}_{\text{geo}}$** | Mid-Depth Spatial Forcing | $1 - \frac{\text{Proj}(\mathbf{z}_{\text{VLM}}^{(L24)}) \cdot \mathbf{z}_{\text{VGGT}}}{\| \text{Proj}(\mathbf{z}_{\text{VLM}}^{(L24)}) \|_2 \, \| \mathbf{z}_{\text{VGGT}} \|_2}$ | Frozen VGGT Layer 24 latents + UV positional embeddings |
 
 ### 2.2 Temporal Coordinate Canonicalization (Zero-Drift Invariance)
