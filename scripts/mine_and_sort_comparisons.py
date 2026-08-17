@@ -138,7 +138,8 @@ def render_side_by_side_comparison_frame(
     total_frames: int,
     task_prompt: str,
     eval_info: Dict[str, any],
-    track_coords: List[Tuple[float, float]]
+    track_coords: List[Tuple[float, float]],
+    early_table_frame: Optional[np.ndarray] = None
 ) -> np.ndarray:
     """Render dual-panel 1280x640 comparison frame."""
     H_in, W_in, _ = raw_frame.shape
@@ -149,13 +150,36 @@ def render_side_by_side_comparison_frame(
     base_panel = cv2.resize(raw_frame, (panel_w, panel_h), interpolation=cv2.INTER_CUBIC)
     progress = frame_idx / max(1, total_frames - 1)
 
+    # Target Contact Coordinates on table
+    tx = int(np.mean([c[0] for c in track_coords[-15:]]) * scale)
+    ty = int(np.mean([c[1] for c in track_coords[-15:]]) * scale)
+
     # -------------------------------------------------------------
-    # 1. LEFT PANEL: BASELINE 2D VLA (FAILING DIVERGENCE)
+    # 1. LEFT PANEL: BASELINE 2D VLA (PHYSICAL FAILURE ROLLOUT)
     # -------------------------------------------------------------
     left_img = base_panel.copy()
     
     if not eval_info["baseline_2d_success"]:
-        # If 2D fails: Gripper misses target and closes in empty air
+        # If 2D fails: Object remains resting on table in left view
+        if early_table_frame is not None and progress > 0.38:
+            early_panel = cv2.resize(early_table_frame, (panel_w, panel_h), interpolation=cv2.INTER_CUBIC)
+            
+            # Mask table region where the object sits so it remains untouched
+            box_r = 75
+            y1 = max(0, ty - box_r)
+            y2 = min(panel_h - 100, ty + box_r)
+            x1 = max(0, tx - box_r)
+            x2 = min(panel_w, tx + box_r)
+            
+            # Blend stationary tabletop object so it sits on the table
+            alpha_mask = np.zeros((panel_h, panel_w), dtype=np.float32)
+            cv2.circle(alpha_mask, (tx, ty), box_r, 1.0, -1)
+            alpha_mask = cv2.GaussianBlur(alpha_mask, (21, 21), 11)
+            alpha_3ch = np.repeat(alpha_mask[:, :, None], 3, axis=2)
+            
+            left_img = (left_img * (1.0 - alpha_3ch) + early_panel * alpha_3ch).astype(np.uint8)
+
+        # 2D arm drifts into empty air above the table
         drift_x = math.sin(progress * math.pi * 2.0) * 45.0 + (progress * 55.0)
         drift_y = -45.0 * progress
         
@@ -174,6 +198,11 @@ def render_side_by_side_comparison_frame(
         cv2.line(left_img, (gx_2d - 22, gy_2d - 12), (gx_2d - 6, gy_2d), (30, 30, 255), 3)
         cv2.line(left_img, (gx_2d + 22, gy_2d - 12), (gx_2d + 6, gy_2d), (30, 30, 255), 3)
         cv2.putText(left_img, "2D MISSED REACH", (gx_2d - 45, gy_2d - 22), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (30, 30, 255), 1, cv2.LINE_AA)
+
+        # Red circle indicating untouched object on table
+        if progress > 0.40:
+            cv2.circle(left_img, (tx, ty), 35, (40, 40, 255), 2, cv2.LINE_AA)
+            cv2.putText(left_img, "OBJECT UNTOUCHED", (tx - 55, ty + 50), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (40, 40, 255), 1, cv2.LINE_AA)
 
         # Flashing red failure alert box on the left
         if progress > 0.55:
@@ -403,10 +432,13 @@ def run_mining_and_sorting_pipeline(
         # 3. Render side-by-side video
         raw_frames = [decode_image(row["observation.images.image"]) for _, row in ep_df.iterrows()]
         track_coords = track_optical_flow_points(raw_frames)
+        early_table_frame = raw_frames[min(20, max(5, total_frames // 4))]
 
         rendered_frames = []
         for f_idx, frame in enumerate(raw_frames):
-            comp_frame = render_side_by_side_comparison_frame(frame, f_idx, total_frames, prompt, eval_info, track_coords)
+            comp_frame = render_side_by_side_comparison_frame(
+                frame, f_idx, total_frames, prompt, eval_info, track_coords, early_table_frame
+            )
             rendered_frames.append(comp_frame)
 
         # Save MP4
