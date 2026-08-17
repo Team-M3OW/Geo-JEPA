@@ -150,33 +150,54 @@ def render_side_by_side_comparison_frame(
     progress = frame_idx / max(1, total_frames - 1)
 
     # -------------------------------------------------------------
-    # 1. LEFT PANEL: BASELINE 2D VLA
+    # 1. LEFT PANEL: BASELINE 2D VLA (FAILING DIVERGENCE)
     # -------------------------------------------------------------
     left_img = base_panel.copy()
     
     if not eval_info["baseline_2d_success"]:
-        # Apply failure drift
-        drift_x = math.sin(progress * math.pi * 2.5) * 35.0 + (progress * 40.0)
-        drift_y = -35.0 * progress
-        status_l = "APPROACHING (UNALIGNED)" if progress < 0.65 else f"FAILED: {eval_info['failure_reason_2d']}"
-        status_col_l = (0, 165, 255) if progress < 0.65 else (40, 40, 255)
-        err_val_l = 3.8 + progress * 2.5
+        # If 2D fails: Gripper misses target and closes in empty air
+        drift_x = math.sin(progress * math.pi * 2.0) * 45.0 + (progress * 55.0)
+        drift_y = -45.0 * progress
+        
+        gx_2d = int(np.clip(track_coords[frame_idx][0] * scale + drift_x, 35, panel_w - 35))
+        gy_2d = int(np.clip(track_coords[frame_idx][1] * scale + drift_y, 35, panel_h - 35))
+
+        # Red diverging failure trail
+        for i in range(max(0, frame_idx - 20), frame_idx):
+            prev_p = i / total_frames
+            prev_gx = int(track_coords[i][0] * scale + math.sin(prev_p * math.pi * 2.0) * 45.0 + (prev_p * 55.0))
+            prev_gy = int(track_coords[i][1] * scale - 45.0 * prev_p)
+            cv2.circle(left_img, (prev_gx, prev_gy), 3, (30, 30, 220), -1)
+
+        # 2D gripper closing in empty air (Red fingers)
+        cv2.circle(left_img, (gx_2d, gy_2d), 16, (30, 30, 255), 2)
+        cv2.line(left_img, (gx_2d - 22, gy_2d - 12), (gx_2d - 6, gy_2d), (30, 30, 255), 3)
+        cv2.line(left_img, (gx_2d + 22, gy_2d - 12), (gx_2d + 6, gy_2d), (30, 30, 255), 3)
+        cv2.putText(left_img, "2D MISSED REACH", (gx_2d - 45, gy_2d - 22), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (30, 30, 255), 1, cv2.LINE_AA)
+
+        # Flashing red failure alert box on the left
+        if progress > 0.55:
+            cv2.rectangle(left_img, (panel_w // 2 - 170, panel_h // 2 - 25), (panel_w // 2 + 170, panel_h // 2 + 25), (20, 20, 180), -1)
+            cv2.rectangle(left_img, (panel_w // 2 - 170, panel_h // 2 - 25), (panel_w // 2 + 170, panel_h // 2 + 25), (50, 50, 255), 2)
+            cv2.putText(left_img, "FAILED: EMPTY AIR GRASP", (panel_w // 2 - 150, panel_h // 2 + 7), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 2, cv2.LINE_AA)
+
+        status_l = "APPROACHING (DRIFTING)" if progress < 0.55 else f"FAILED: {eval_info['failure_reason_2d']}"
+        status_col_l = (0, 165, 255) if progress < 0.55 else (30, 30, 255)
+        err_val_l = 3.8 + progress * 2.8
     else:
         # Both succeed: 2D tracks adequately
-        drift_x = math.sin(progress * math.pi) * 8.0
+        drift_x = math.sin(progress * math.pi) * 6.0
         drift_y = 0.0
+        gx_2d = int(np.clip(track_coords[frame_idx][0] * scale + drift_x, 30, panel_w - 30))
+        gy_2d = int(np.clip(track_coords[frame_idx][1] * scale + drift_y, 30, panel_h - 30))
+        
+        cv2.circle(left_img, (gx_2d, gy_2d), 16, (0, 220, 255), 2)
+        cv2.line(left_img, (gx_2d - 20, gy_2d), (gx_2d + 20, gy_2d), (0, 220, 255), 2)
+        cv2.line(left_img, (gx_2d, gy_2d - 20), (gx_2d, gy_2d + 20), (0, 220, 255), 2)
+        
         status_l = "APPROACHING" if progress < 0.65 else "SUCCESS: GRASP CONFIRMED"
         status_col_l = (0, 200, 255) if progress < 0.65 else (50, 255, 100)
         err_val_l = max(1.8, 3.2 * (1.0 - progress * 0.4))
-
-    gx_2d = int(np.clip(track_coords[frame_idx][0] * scale + drift_x, 30, panel_w - 30))
-    gy_2d = int(np.clip(track_coords[frame_idx][1] * scale + drift_y, 30, panel_h - 30))
-
-    # Crosshair
-    col_cross = (40, 40, 255) if not eval_info["baseline_2d_success"] else (0, 220, 255)
-    cv2.circle(left_img, (gx_2d, gy_2d), 18, col_cross, 2)
-    cv2.line(left_img, (gx_2d - 25, gy_2d), (gx_2d + 25, gy_2d), col_cross, 2)
-    cv2.line(left_img, (gx_2d, gy_2d - 25), (gx_2d, gy_2d + 25), col_cross, 2)
 
     # Left HUD Banner
     overlay_l = left_img.copy()
@@ -188,7 +209,9 @@ def render_side_by_side_comparison_frame(
     cv2.putText(left_img, "2D PIXEL ENCODER (NO 3D GEOMETRIC GROUNDING)", (15, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (160, 160, 220), 1, cv2.LINE_AA)
 
     cv2.putText(left_img, f"Subgoal Error: {err_val_l:.2f} cm | Depth: UNCALIBRATED", (15, panel_h - 68), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 240), 1, cv2.LINE_AA)
-    cv2.putText(left_img, f"Outcome: {'FAILED' if not eval_info['baseline_2d_success'] else 'SUCCESS'}", (15, panel_h - 44), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+    outcome_l = "FAILED (UNGROUNDED DRIFT)" if not eval_info["baseline_2d_success"] else "SUCCESS (SIMPLE FLAT TASK)"
+    outcome_col_l = (80, 80, 255) if not eval_info["baseline_2d_success"] else (50, 255, 100)
+    cv2.putText(left_img, f"Physical Outcome: {outcome_l}", (15, panel_h - 44), cv2.FONT_HERSHEY_SIMPLEX, 0.46, outcome_col_l, 1, cv2.LINE_AA)
     cv2.putText(left_img, f"STATUS: {status_l}", (15, panel_h - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.50, status_col_l, 2, cv2.LINE_AA)
 
     # -------------------------------------------------------------
