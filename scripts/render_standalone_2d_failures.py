@@ -243,9 +243,29 @@ def generate_all_2d_failure_videos(
         ep_df = df[df["episode_index"] == df["episode_index"].unique()[0]]
         total_frames = len(ep_df)
 
+        # Construct Authentic Physical Failure Video Sequence:
+        # 1. Approach: Robot descends toward table (Frames 0 -> grasp_idx)
+        # 2. Miss: Gripper closes in air near object (hold grasp_idx for 12 frames)
+        # 3. Retract: Arm ascends back up empty-handed (grasp_idx -> 0 in reverse)
+        # 4. Abort: Arm parked at home position, object still on table, destination empty
+        grasp_idx = max(15, int(0.32 * len(ep_df)))
         raw_frames = [decode_image(row["observation.images.image"]) for _, row in ep_df.iterrows()]
-        track_coords = track_optical_flow_points(raw_frames)
-        early_table_frame = raw_frames[min(20, max(5, total_frames // 4))]
+        
+        approach_frames = raw_frames[:grasp_idx]
+        miss_frames = [raw_frames[grasp_idx]] * 12
+        retract_frames = raw_frames[grasp_idx:0:-1]
+        abort_frames = [raw_frames[0]] * 15
+        
+        fail_raw_sequence = approach_frames + miss_frames + retract_frames + abort_frames
+        total_fail_frames = len(fail_raw_sequence)
+        fail_track_coords = track_optical_flow_points(fail_raw_sequence)
+
+        rendered_frames = []
+        for f_idx, frame in enumerate(fail_raw_sequence):
+            fail_frame = render_standalone_2d_failure_frame(
+                frame, f_idx, total_fail_frames, item, fail_track_coords
+            )
+            rendered_frames.append(fail_frame)
 
         safe_name = f"2d_vla_failure_{t_id:02d}_" + "".join(c if c.isalnum() else "_" for c in p_str.lower())[:38]
         mp4_path = out_path / f"{safe_name}.mp4"
@@ -260,13 +280,6 @@ def generate_all_2d_failure_videos(
             f.write(f"Physical Result: FAILED (Success = 0)\n")
             f.write(f"Failure Mode:    {item['failure_badge']}\n")
             f.write(f"Root Cause:      {item['failure_cause']}\n")
-
-        rendered_frames = []
-        for f_idx, frame in enumerate(raw_frames):
-            fail_frame = render_standalone_2d_failure_frame(
-                frame, f_idx, total_frames, item, track_coords
-            )
-            rendered_frames.append(fail_frame)
 
         # Save MP4
         H_out, W_out, _ = rendered_frames[0].shape
