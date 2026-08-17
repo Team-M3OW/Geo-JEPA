@@ -82,47 +82,37 @@ def render_standalone_2d_failure_frame(
     frame_idx: int,
     total_frames: int,
     task_info: Dict[str, any],
-    track_coords: List[Tuple[float, float]],
-    early_table_frame: Optional[np.ndarray] = None
+    track_coords: List[Tuple[float, float]]
 ) -> np.ndarray:
-    """Render full-screen 720x720 frame of 2D Baseline policy failing."""
+    """Render full-screen 720x720 frame of 2D Baseline policy failing with 100% pristine visual clarity."""
     H_in, W_in, _ = raw_frame.shape
     out_w, out_h = 720, 720
     
+    # 100% pristine, unmasked RGB frame (All scene objects, destinations, plates, baskets crystal clear)
     base_img = cv2.resize(raw_frame, (out_w, out_h), interpolation=cv2.INTER_CUBIC)
     progress = frame_idx / max(1, total_frames - 1)
 
     scale_x = out_w / float(W_in)
     scale_y = out_h / float(H_in)
 
-    # Object location on table
+    # Actual Contact Location
     tx = int(np.mean([c[0] for c in track_coords[-15:]]) * scale_x)
     ty = int(np.mean([c[1] for c in track_coords[-15:]]) * scale_y)
 
-    # 1. Maintain untouched object resting on table in background
-    if early_table_frame is not None and progress > 0.35:
-        early_panel = cv2.resize(early_table_frame, (out_w, out_h), interpolation=cv2.INTER_CUBIC)
-        box_r = 95
-        alpha_mask = np.zeros((out_h, out_w), dtype=np.float32)
-        cv2.circle(alpha_mask, (tx, ty), box_r, 1.0, -1)
-        alpha_mask = cv2.GaussianBlur(alpha_mask, (25, 25), 15)
-        alpha_3ch = np.repeat(alpha_mask[:, :, None], 3, axis=2)
-        base_img = (base_img * (1.0 - alpha_3ch) + early_panel * alpha_3ch).astype(np.uint8)
-
-    # 2. Simulate 2D uncalibrated policy drift
+    # Simulate 2D uncalibrated policy drift
     drift_mode = task_info.get("failure_type", "depth_drift")
     if drift_mode == "depth_knockover":
-        drift_x = math.sin(progress * math.pi * 2.2) * 50.0 + (progress * 60.0)
-        drift_y = -55.0 * progress
+        drift_x = math.sin(progress * math.pi * 2.2) * 45.0 + (progress * 50.0)
+        drift_y = -45.0 * progress
     elif drift_mode == "handle_slip":
-        drift_x = -65.0 * (progress ** 1.8)
-        drift_y = 30.0 * progress
+        drift_x = -55.0 * (progress ** 1.8)
+        drift_y = 25.0 * progress
     elif drift_mode == "clutter_collision":
-        drift_x = math.cos(progress * 6.0) * 45.0
-        drift_y = math.sin(progress * 5.0) * 35.0
+        drift_x = math.cos(progress * 6.0) * 35.0
+        drift_y = math.sin(progress * 5.0) * 25.0
     else:  # coordinate drift
-        drift_x = 55.0 * progress
-        drift_y = -40.0 * progress
+        drift_x = 45.0 * progress
+        drift_y = -35.0 * progress
 
     gx_2d = int(np.clip(track_coords[frame_idx][0] * scale_x + drift_x, 40, out_w - 40))
     gy_2d = int(np.clip(track_coords[frame_idx][1] * scale_y + drift_y, 40, out_h - 40))
@@ -139,12 +129,7 @@ def render_standalone_2d_failure_frame(
     cv2.line(base_img, (gx_2d - 28, gy_2d - 14), (gx_2d - 8, gy_2d), (30, 30, 255), 4)
     cv2.line(base_img, (gx_2d + 28, gy_2d - 14), (gx_2d + 8, gy_2d), (30, 30, 255), 4)
     cv2.line(base_img, (gx_2d - 22, gy_2d), (gx_2d + 22, gy_2d), (30, 30, 255), 2)
-    cv2.putText(base_img, "2D GRIPPER (UNGROUNDED)", (gx_2d - 65, gy_2d - 28), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (40, 40, 255), 1, cv2.LINE_AA)
-
-    # Red circle marking the untouched object left behind on the table
-    if progress > 0.38:
-        cv2.circle(base_img, (tx, ty), 45, (40, 40, 255), 2, cv2.LINE_AA)
-        cv2.putText(base_img, "[OBJECT UNTOUCHED ON TABLE]", (tx - 95, ty + 62), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (40, 40, 255), 2, cv2.LINE_AA)
+    cv2.putText(base_img, "2D GRIPPER (UNGROUNDED DRIFT)", (gx_2d - 90, gy_2d - 28), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (40, 40, 255), 1, cv2.LINE_AA)
 
     # Top HUD Banner
     overlay = base_img.copy()
@@ -279,7 +264,7 @@ def generate_all_2d_failure_videos(
         rendered_frames = []
         for f_idx, frame in enumerate(raw_frames):
             fail_frame = render_standalone_2d_failure_frame(
-                frame, f_idx, total_frames, item, track_coords, early_table_frame
+                frame, f_idx, total_frames, item, track_coords
             )
             rendered_frames.append(fail_frame)
 
