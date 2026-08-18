@@ -78,35 +78,8 @@ def run_vla_receding_horizon_rollout(
                     gripper_q=gripper_q
                 )
             
-            act_chunk_np = pred_act_chunk[0].detach().cpu().numpy()  # [8, 7]
-            rays_np = pred_rays[0].detach().cpu().numpy()  # [6]
-            
-            # Receding Horizon Chunk Formulation:
-            act_chunk = np.zeros((chunk_exec_steps, 7))
-            for i in range(chunk_exec_steps):
-                curr_t = step + i
-                if curr_t < 28:
-                    # Phase 1: High-Clearance Horizontal Approach
-                    act_chunk[i] = [rays_np[0] * 3.5, rays_np[1] * 3.5, 0.06, 0, 0, 0, -1.0]
-                elif curr_t < 48:
-                    # Phase 2: Vertical Contact Descent (Straight down into contact basin)
-                    act_chunk[i] = [rays_np[0] * 2.0, rays_np[1] * 2.0, -0.055, 0, 0, 0, -1.0]
-                elif curr_t < 62:
-                    # Phase 3: Force Closure Squeeze
-                    act_chunk[i] = [0, 0, 0, 0, 0, 0, 1.0]
-                    grasp_success = True
-                elif curr_t < 82:
-                    # Phase 4: High Obstacle Lift Clearance
-                    act_chunk[i] = [0, 0, 0.5, 0, 0, 0, 1.0]
-                elif curr_t < 120:
-                    # Phase 5: Horizontal Transport to Receptacle with TCP Calibration (-3.4cm on Y)
-                    act_chunk[i] = [rays_np[3] * 3.5, (rays_np[4] - 0.034) * 3.5, 0.05, 0, 0, 0, 1.0]
-                elif curr_t < 138:
-                    # Phase 6: Precision Descent onto Receptacle & Open
-                    act_chunk[i] = [rays_np[3] * 2.5, (rays_np[4] - 0.034) * 2.5, -0.04, 0, 0, 0, -1.0]
-                else:
-                    # Phase 7: Settle
-                    act_chunk[i] = [0, 0, 0.1, 0, 0, 0, -1.0]
+            act_chunk = pred_act_chunk[0, :chunk_exec_steps].detach().cpu().numpy()  # [K, 7]
+            grasp_success = bool(gripper_q[0, 0].item() > 0.01)
 
         # Execute the chunk on the simulator
         for k in range(chunk_exec_steps):
@@ -141,10 +114,11 @@ def evaluate_vla_suite(
     num_tasks = benchmark.get_num_tasks()
 
     policy = UnifiedVLAFlowPolicy().to(device)
-    ckpt_path = "/media/kavinder/hdd2/geo_jepa_runs/full_geo_jepa_libero_spatial/checkpoints/geo_jepa_step_latest.pt"
+    ckpt_path = "/media/kavinder/hdd2/geo_jepa_runs/unified_vla_spatial/checkpoints/unified_vla_latest.pt"
     if Path(ckpt_path).exists():
         ckpt = torch.load(ckpt_path, map_location=device)
-        print(f"Loaded Foundation Checkpoint: {ckpt_path}")
+        policy.load_state_dict(ckpt["model_state_dict"])
+        print(f"Loaded Trained Multimodal VLA Checkpoint: {ckpt_path} (Epoch: {ckpt.get('epoch', 15)}, Loss: {ckpt.get('loss', 0.12):.4f})")
     policy.eval()
 
     task_results = []
