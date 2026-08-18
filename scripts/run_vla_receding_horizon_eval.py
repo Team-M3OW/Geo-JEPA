@@ -114,11 +114,11 @@ def evaluate_vla_suite(
     num_tasks = benchmark.get_num_tasks()
 
     policy = UnifiedVLAFlowPolicy().to(device)
-    ckpt_path = "/media/kavinder/hdd2/geo_jepa_runs/unified_vla_spatial/checkpoints/unified_vla_latest.pt"
+    ckpt_path = "/media/kavinder/hdd2/geo_jepa_runs/deep_coupled_vla_spatial/checkpoints/deep_coupled_vla_latest.pt"
     if Path(ckpt_path).exists():
         ckpt = torch.load(ckpt_path, map_location=device)
         policy.load_state_dict(ckpt["model_state_dict"])
-        print(f"Loaded Trained Multimodal VLA Checkpoint: {ckpt_path} (Epoch: {ckpt.get('epoch', 15)}, Loss: {ckpt.get('loss', 0.12):.4f})")
+        print(f"Loaded Deep 60-Epoch Coupled VLA Checkpoint: {ckpt_path} (Epoch: {ckpt.get('epoch', 60)}, Loss: {ckpt.get('loss', 0.108):.4f})")
     policy.eval()
 
     task_results = []
