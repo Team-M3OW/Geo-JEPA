@@ -86,14 +86,17 @@ def execute_official_libero_rollout(
     grasp_success = False
     min_dist = 999.0
 
-    # Extract target objects from observation
-    bowl_pos = None
-    plate_pos = None
-    for k in obs:
-        if "bowl" in k and "pos" in k and "eef" not in k:
-            bowl_pos = obs[k].copy()
-        if "plate" in k and "pos" in k and "eef" not in k:
-            plate_pos = obs[k].copy()
+    # Extract target objects from observation accurately
+    bowl_pos = obs.get("akita_black_bowl_1_pos", None)
+    plate_pos = obs.get("plate_1_pos", None)
+    if bowl_pos is None:
+        for k in obs:
+            if "bowl" in k and k.endswith("_pos") and "eef" not in k and "to" not in k:
+                bowl_pos = obs[k].copy()
+    if plate_pos is None:
+        for k in obs:
+            if "plate" in k and k.endswith("_pos") and "eef" not in k and "to" not in k:
+                plate_pos = obs[k].copy()
 
     if bowl_pos is None: bowl_pos = np.array([-0.06, 0.20, 0.90])
     if plate_pos is None: plate_pos = np.array([0.05, 0.20, 0.90])
